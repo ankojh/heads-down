@@ -2,16 +2,20 @@ import Foundation
 
 /// Client for a locally running `laya-serve` (loopback only).
 ///
-/// Request shape matches `bench/load.py`; the question is copied verbatim from `bench/cases.py`
-/// because Laya's accuracy is very sensitive to wording. Response envelope (checked against a real
+/// Request shape matches `bench/load.py`; the question is `DistractionQuestion` (verbatim from
+/// `bench/cases.py`). Response envelope (checked against a real
 /// 0.3.26 batch response and `laya/serve.py`): `{"results": [...], "total_usage": {...}}`, one
 /// result per state in request order, score at `results[i].answers.distracting.noul`.
 final class LayaClient: DistractionClassifier {
     let providerID = "laya-local"
-    let questionVersion = "distracting-noul-v1"
+    let questionVersion = DistractionQuestion.version
+    let displayName = "Laya (local)"
     let baseURL: URL
     /// The server collates a batch into one forward pass; keep requests modest.
-    static let maxBatch = 16
+    let maxItemsPerRequest = 16
+    /// The server runs one inference at a time; concurrency would only queue.
+    let maxConcurrentRequests = 1
+    let usdPerMillionInputTokens = 0.0
 
     private let session: URLSession
 
@@ -27,60 +31,46 @@ final class LayaClient: DistractionClassifier {
         session = URLSession(configuration: config)
     }
 
-    private static let questions: [String: Any] = [
-        "distracting": [
-            "type": "noul",
-            "instructions": "Would looking at this screen region pull the user away from their current task?",
-            "criteria": [
-                "false": "Relevant to or supports the current task",
-                "true": "Unrelated to the current task and likely to distract",
-            ],
-        ],
-    ]
-
-    func classify(task: String, regions: [ClassifierInput]) async throws -> [RegionScore] {
-        var scores: [RegionScore] = []
-        var start = 0
-        while start < regions.count {
-            let chunk = Array(regions[start..<min(regions.count, start + Self.maxBatch)])
-            scores += try await classifyChunk(task: task, regions: chunk)
-            start += Self.maxBatch
-        }
-        return scores
-    }
-
-    private func classifyChunk(task: String, regions: [ClassifierInput]) async throws -> [RegionScore] {
-        let states: [[String: Any]] = regions.map { region in
-            [
-                "current_task": task,
-                "screen_region": ["app": region.app, "title": region.title, "text": region.text],
-            ]
-        }
-        let body: [String: Any] = ["model": "laya", "states": states, "questions": Self.questions]
+    /// One local batch request (up to `maxItemsPerRequest` inputs); per-item outcomes once it returns.
+    func classify(task: String, inputs: [ClassifierInput]) async -> [ItemOutcome] {
+        func all(_ outcome: ItemOutcome) -> [ItemOutcome] { Array(repeating: outcome, count: inputs.count) }
+        if Task.isCancelled { return all(ItemOutcome(error: .cancelled, cancelled: true)) }
+        let states = inputs.map { DistractionQuestion.state(task: task, region: $0) }
+        let body: [String: Any] = ["model": "laya", "states": states, "questions": DistractionQuestion.questions]
         var request = URLRequest(url: baseURL.appendingPathComponent("v1/systemone/batch"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
+            return all(ItemOutcome(error: .malformed("could not encode request")))
+        }
+        request.httpBody = payload
 
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: request)
         } catch let error as URLError {
-            throw error.code == .timedOut ? ClassifierError.timeout : ClassifierError.unreachable
+            if error.code == .cancelled || Task.isCancelled { return all(ItemOutcome(error: .cancelled, cancelled: true)) }
+            return all(ItemOutcome(error: error.code == .timedOut ? .timeout : .unreachable))
+        } catch {
+            return all(ItemOutcome(error: .unreachable))
         }
-        guard let http = response as? HTTPURLResponse else { throw ClassifierError.malformed("no HTTP response") }
+        guard let http = response as? HTTPURLResponse else { return all(ItemOutcome(error: .malformed("no HTTP response"))) }
         switch http.statusCode {
         case 200: break
-        case 429, 503: throw ClassifierError.overloaded(http.statusCode)
-        default: throw ClassifierError.http(http.statusCode)
+        case 429, 503: return all(ItemOutcome(error: .overloaded(http.statusCode), responded: true))
+        default: return all(ItemOutcome(error: .http(http.statusCode), responded: true))
         }
-        return try Self.decode(data, expectedCount: regions.count)
+        do {
+            return try Self.decode(data, expectedCount: inputs.count)
+        } catch {
+            return all(ItemOutcome(error: (error as? ClassifierError) ?? .malformed("bad response"), responded: true))
+        }
     }
 
     /// Strict decoding: the result count must match, and each score must be a finite number in [0, 1].
-    /// A bad item becomes nil (unknown) rather than failing the whole batch.
-    static func decode(_ data: Data, expectedCount: Int) throws -> [RegionScore] {
+    /// A bad item becomes an unscorable outcome rather than failing the whole batch.
+    static func decode(_ data: Data, expectedCount: Int) throws -> [ItemOutcome] {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let results = root["results"] as? [Any]
         else { throw ClassifierError.malformed("missing results array") }
@@ -88,14 +78,13 @@ final class LayaClient: DistractionClassifier {
             throw ClassifierError.malformed("expected \(expectedCount) results, got \(results.count)")
         }
         return results.map { item in
-            guard let result = item as? [String: Any],
-                  let answers = result["answers"] as? [String: Any],
-                  let distracting = answers["distracting"] as? [String: Any],
-                  let number = distracting["noul"] as? NSNumber,
-                  CFGetTypeID(number) != CFBooleanGetTypeID()
-            else { return RegionScore(pDistracting: nil) }
-            let value = number.doubleValue
-            return RegionScore(pDistracting: value.isFinite && (0...1).contains(value) ? value : nil)
+            let result = item as? [String: Any]
+            var outcome = ItemOutcome(responded: true)
+            outcome.score = DistractionQuestion.score(fromAnswers: result?["answers"])
+            outcome.model = result?["model"] as? String
+            outcome.inputTokens = ((result?["usage"] as? [String: Any])?["input_tokens"] as? NSNumber)?.intValue
+            if outcome.score == nil { outcome.error = .malformed("missing or invalid noul score") }
+            return outcome
         }
     }
 

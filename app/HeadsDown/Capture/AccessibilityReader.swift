@@ -5,6 +5,13 @@ import Foundation
 struct AXReadResult {
     var texts: [TextObservation] = []
     var containers: [AXContainer] = []
+    /// Toolbars and large content areas, used to find where window chrome ends.
+    var layoutFrames: [AXContainer] = []
+    /// Interactive controls (search/text fields, buttons, menus, tabs, toolbars). Never covered.
+    var controls: [CGRect] = []
+    /// Scrolling containers (scroll areas, web areas), clipped to the visible area. Scroll
+    /// tracking uses them to tell which pane moved; they are read once per cycle, not polled.
+    var scrollAreas: [AXContainer] = []
     var nodesVisited = 0
     var limitHit: String?
     var windowMatched = false
@@ -36,9 +43,35 @@ enum AccessibilityReader {
         "AXSplitGroup", "AXTabGroup", "AXWebArea", "AXLayoutArea", "AXLayoutItem", "AXBrowser",
         "AXGrid", "AXLink", "AXSheet",
     ]
+    /// Links are deliberately absent: in feeds the distracting titles are usually links.
+    private static let controlRoles: Set<String> = [
+        "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXButton", "AXPopUpButton",
+        "AXMenuButton", "AXCheckBox", "AXRadioButton", "AXTabGroup", "AXToolbar", "AXSlider",
+        "AXIncrementor", "AXSegmentedControl", "AXDisclosureTriangle",
+    ]
+    /// Bigger "controls" are usually content (editors, card-sized buttons) and stay coverable.
+    static let maxControlHeight: CGFloat = 80
+    static let maxControlAreaFraction: CGFloat = 0.04
+
+    private static let layoutRoles: Set<String> = [
+        "AXToolbar", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXGroup", "AXTabGroup",
+    ]
+
+    private static let scrollRoles: Set<String> = ["AXScrollArea", "AXWebArea"]
+    static let minScrollAreaSize = CGSize(width: 120, height: 80)
 
     private struct Node {
         let element: AXUIElement
+        let depth: Int
+    }
+
+    /// Attributes already fetched for one visited element.
+    private struct NodeInfo {
+        let role: String
+        let subrole: String?
+        let rect: CGRect?
+        let values: [AnyObject?]
+        let hasChildren: Bool
         let depth: Int
     }
 
@@ -81,9 +114,10 @@ enum AccessibilityReader {
             if let rect, rect.area > 0, !rect.intersects(visible) { continue }
 
             let children = children(of: node.element, role: role, fallback: values[7])
-            collect(
+            let info = NodeInfo(
                 role: role, subrole: subrole, rect: rect, values: values, hasChildren: !children.isEmpty,
-                depth: node.depth, target: target, generation: generation, into: &result)
+                depth: node.depth)
+            collect(info, target: target, generation: generation, into: &result)
 
             if node.depth < maxDepth {
                 queue.append(contentsOf: children.map { Node(element: $0, depth: node.depth + 1) })
@@ -96,9 +130,10 @@ enum AccessibilityReader {
     }
 
     private static func collect(
-        role: String, subrole: String?, rect: CGRect?, values: [AnyObject?], hasChildren: Bool,
-        depth: Int, target: TargetWindow, generation: UInt64, into result: inout AXReadResult
+        _ info: NodeInfo, target: TargetWindow, generation: UInt64, into result: inout AXReadResult
     ) {
+        let role = info.role, subrole = info.subrole, rect = info.rect, values = info.values
+        let hasChildren = info.hasChildren, depth = info.depth
         guard let rect, rect.area > 0 else { return }
         let visible = target.visibleRect
         let clipped = rect.intersection(visible)
@@ -127,6 +162,17 @@ enum AccessibilityReader {
         }
         if containerRoles.contains(role), hasChildren {
             result.containers.append(AXContainer(rect: clipped, role: role, subrole: subrole, depth: depth))
+        }
+        if controlRoles.contains(role) || subrole == "AXSearchField",
+           clipped.height <= maxControlHeight, clipped.area <= maxControlAreaFraction * visible.area {
+            result.controls.append(clipped)
+        }
+        if scrollRoles.contains(role), clipped.width >= minScrollAreaSize.width,
+           clipped.height >= minScrollAreaSize.height {
+            result.scrollAreas.append(AXContainer(rect: clipped, role: role, subrole: subrole, depth: depth))
+        }
+        if layoutRoles.contains(role), role == "AXToolbar" || clipped.area >= 0.2 * visible.area {
+            result.layoutFrames.append(AXContainer(rect: clipped, role: role, subrole: subrole, depth: depth))
         }
     }
 

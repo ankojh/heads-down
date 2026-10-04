@@ -38,7 +38,6 @@ enum Segmenter {
     static let sameLineGap: CGFloat = 1.2
     static let stackedLineGap: CGFloat = 0.9
     static let maxLineHeightRatio: CGFloat = 2.2
-    static let maxRegionChars = 1200
     static let minAlphanumerics = 3
 
     private struct Group {
@@ -107,12 +106,15 @@ enum Segmenter {
         // 5. Emit regions.
         var regions: [ScreenRegion] = []
         var seen: [String: Int] = [:]
+        let appName = CanonicalInput.app(input.appName)
+        let title = CanonicalInput.title(input.windowTitle)
         let ordered = groups.sorted { lhs, rhs in
             let left = bounds(of: lhs, obs: obs), right = bounds(of: rhs, obs: obs)
             return abs(left.minY - right.minY) > 4 ? left.minY < right.minY : left.minX < right.minX
         }
         for group in ordered {
-            let text = readingOrderText(group.members.map { obs[$0] })
+            // The exact text the classifier will see; tracking and cache keys both derive from it.
+            let text = CanonicalInput.text(readingOrderText(group.members.map { obs[$0] }))
             if text.unicodeScalars.filter({ CharacterSet.alphanumerics.contains($0) }).count < minAlphanumerics {
                 output.droppedTiny += 1
                 continue
@@ -132,14 +134,13 @@ enum Segmenter {
             let fingerprint = Fingerprint.of(normalized: Fingerprint.normalize(text))
             let occurrence = seen[fingerprint, default: 0]
             seen[fingerprint] = occurrence + 1
-            let classifierFingerprint = Fingerprint.of(
-                normalized: input.appName + "\u{1f}" + input.windowTitle + "\u{1f}" + text)
+            let classifierFingerprint = CanonicalInput.key(app: appName, title: title, text: text)
             var reason = group.reason
             if uncertain { reason += "; overlaps a higher window" }
             regions.append(ScreenRegion(
                 id: "\(fingerprint.prefix(10))-\(occurrence)", number: regions.count + 1, rect: rect,
-                text: String(text.prefix(maxRegionChars)), appName: input.appName,
-                windowTitle: input.windowTitle, sources: sources, observationCount: group.members.count,
+                text: text, appName: appName,
+                windowTitle: title, sources: sources, observationCount: group.members.count,
                 reason: reason, fingerprint: fingerprint, classifierFingerprint: classifierFingerprint,
                 geometryUncertain: uncertain, windowID: input.windowID))
         }

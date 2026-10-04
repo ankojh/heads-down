@@ -4,20 +4,20 @@ import SwiftUI
 /// Menu-bar panel: task, start/pause/stop, mode, status, permissions, classifier, shortcuts.
 struct ControlPanelView: View {
     @ObservedObject var controller: SessionController
+    @ObservedObject var calendar = CalendarAutomation.shared
     @Environment(\.openWindow) private var openWindow
 
     private var startTitle: String {
         switch controller.runState {
         case .stopped, .requestingPermissions: return "Start"
-        case .paused: return "Resume"
-        default: return "Update task"
+        default: return controller.taskSource == .manual ? "Update task" : "Use my typed task"
         }
     }
 
     private var startDisabled: Bool {
         let draft = controller.taskDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if draft.isEmpty || controller.runState == .requestingPermissions { return true }
-        return controller.isActive && draft == controller.currentTask
+        return controller.runState != .stopped && draft == controller.currentTask && controller.taskSource == .manual
     }
 
     var body: some View {
@@ -26,6 +26,8 @@ struct ControlPanelView: View {
             taskSection
             controls
             modeSection
+            Divider()
+            CalendarSection(controller: controller, calendar: calendar)
             Divider()
             statusSection
             Divider()
@@ -44,7 +46,12 @@ struct ControlPanelView: View {
     }
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 8) {
+            Image("BrandIcon")
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 32, height: 32)
+                .accessibilityHidden(true)
             Text("Heads Down").font(.headline)
             Spacer()
             Text(controller.runState.label)
@@ -73,20 +80,63 @@ struct ControlPanelView: View {
                 .textFieldStyle(.roundedBorder)
             if let task = controller.currentTask, controller.runState != .stopped {
                 Text("Current task: \(task)").font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Text(controller.taskSource == .manual ? "Task source: You" : "Task source: Google Calendar")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
 
     private var controls: some View {
-        HStack {
-            Button(startTitle) { controller.start() }
-                .keyboardShortcut(.defaultAction)
-                .disabled(startDisabled)
-            Button(controller.runState == .paused ? "Resume" : "Pause") { controller.togglePause() }
-                .disabled(!(controller.isActive || controller.runState == .paused))
-            Button("Stop") { controller.stop() }
-                .disabled(controller.runState == .stopped)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button(startTitle) { controller.start() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(startDisabled)
+                Spacer()
+                Button("Stop") { controller.stop() }
+                    .disabled(controller.runState == .stopped)
+            }
+            if controller.isActive {
+                HStack {
+                    Button("Pause for 3 min") { controller.pause(minutes: 3) }
+                        .buttonStyle(.borderedProminent)
+                    Button("2 min") { controller.pause(minutes: 2) }
+                    Button("Pause") { controller.pause() }
+                        .help("Pause until you resume (\(HotKeys.pause.display))")
+                }
+            } else if controller.runState == .paused {
+                pausedControls
+            }
         }
+    }
+
+    /// Countdown is derived from the deadline once a second; it never triggers OCR or overlay work.
+    private var pausedControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                Text(pauseText).font(.callout.monospacedDigit().weight(.semibold))
+            }
+            HStack {
+                Button("Resume now") { controller.resume() }
+                    .buttonStyle(.borderedProminent)
+                if controller.pauseDeadline != nil {
+                    Button("Stay paused") { controller.stayPaused() }
+                }
+                Spacer()
+                Menu("Pause again") {
+                    ForEach(SessionController.timedPauseChoices, id: \.self) { minutes in
+                        Button("\(minutes) min") { controller.pause(minutes: minutes) }
+                    }
+                }
+                .fixedSize()
+            }
+        }
+    }
+
+    private var pauseText: String {
+        guard let remaining = controller.pauseRemaining else { return "Paused · until you resume" }
+        let seconds = Int(remaining.components.seconds)
+        return String(format: "Paused · resumes in %d:%02d", seconds / 60, seconds % 60)
     }
 
     private var modeSection: some View {
@@ -96,6 +146,14 @@ struct ControlPanelView: View {
             }
             .pickerStyle(.segmented)
             Text(controller.mode.explanation).font(.caption2).foregroundStyle(.secondary)
+            if controller.mode != .observe {
+                Picker("Hiding", selection: $controller.strictness) {
+                    ForEach(Strictness.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Text("\(controller.strictness.explanation) Search fields, buttons, and other controls stay visible.")
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             Toggle("Show numbered region boxes", isOn: $controller.showBoxes)
             if controller.displays.count > 1 {
                 Picker("Display", selection: $controller.selectedDisplayID) {
@@ -151,19 +209,29 @@ struct ControlPanelView: View {
     }
 
     private var classifierSection: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Laya at \(controller.classifierEndpoint)").font(.caption)
-                Text(controller.classifierStatus).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("Classifier", selection: $controller.provider) {
+                ForEach(ClassifierProvider.allCases) { Text($0.label).tag($0) }
             }
-            Spacer()
-            Button("Check") { controller.refreshClassifierHealth() }.controlSize(.small)
+            .pickerStyle(.segmented)
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("\(controller.classifierName) at \(controller.classifierEndpoint)").font(.caption)
+                    Text(controller.classifierStatus).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                    if controller.provider.sendsTextOffDevice {
+                        Text("Region text, app, window title, and task are sent to TypeSafe.")
+                            .font(.caption2).foregroundStyle(.orange)
+                    }
+                }
+                Spacer()
+                Button("Check") { controller.refreshClassifierHealth() }.controlSize(.small)
+            }
         }
     }
 
     private var shortcutsSection: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("\(HotKeys.pause.display)  pause / resume (clears all overlays)").font(.caption2)
+            Text("\(HotKeys.pause.display)  pause until resumed / resume (clears all overlays)").font(.caption2)
             Text("\(HotKeys.reveal.display)  reveal the region under the pointer for 10 min").font(.caption2)
             if controller.hotKeyStatus != "Registered" {
                 Text("Shortcuts: \(controller.hotKeyStatus)").font(.caption2).foregroundStyle(.orange)
@@ -183,6 +251,87 @@ struct ControlPanelView: View {
                 controller.stop()
                 NSApp.terminate(nil)
             }
+        }
+    }
+}
+
+/// Optional Google Calendar auto-start. Secondary to the typed task.
+private struct CalendarSection: View {
+    @ObservedObject var controller: SessionController
+    @ObservedObject var calendar: CalendarAutomation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Google Calendar (optional)").font(.caption.weight(.semibold))
+                Spacer()
+                connectionButtons
+            }
+            if calendar.connected {
+                Toggle("Automatically start from the current event", isOn: Binding(
+                    get: { calendar.autoStartEnabled }, set: { calendar.setAutoStart($0) }))
+                    .font(.caption)
+                Text(calendar.status.label).font(.caption2).foregroundStyle(statusColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let event = calendar.currentEvent { eventDetails(event) }
+                actions
+            } else {
+                Text("Connect to start focus automatically from the event happening now. Read-only access.")
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if let error = calendar.lastError {
+                Text(error).font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder private var connectionButtons: some View {
+        if calendar.connecting {
+            Text("Waiting for browser…").font(.caption2).foregroundStyle(.secondary)
+            Button("Cancel") { calendar.cancelConnect() }.controlSize(.small)
+        } else if calendar.connected {
+            Button("Disconnect") { calendar.disconnect() }.controlSize(.small)
+        } else {
+            Button("Connect Google Calendar") { calendar.connect() }.controlSize(.small)
+        }
+    }
+
+    private func eventDetails(_ event: CalendarEvent) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            let times = [event.start, event.end].compactMap { $0?.formatted(date: .omitted, time: .shortened) }
+            Text("Now: \(event.summary ?? "Busy (details hidden)") · \(times.joined(separator: "–"))"
+                 + (calendar.overlapping > 0 ? " · \(calendar.overlapping) other event(s) overlap" : ""))
+                .font(.caption2).lineLimit(2)
+            if let brief = calendar.brief, brief.insufficientReason == nil {
+                Text("Focus brief: \(brief.text)").font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+            } else if let reason = calendar.brief?.insufficientReason {
+                Text("Not used: \(reason)").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var actions: some View {
+        HStack {
+            if case .skipped = calendar.status {
+                Button("Resume this event") { calendar.resumeThisEvent() }.controlSize(.small)
+            } else if case .pausedByUser = calendar.status, controller.runState != .paused {
+                Button("Re-arm") { calendar.resumeThisEvent() }.controlSize(.small)
+            }
+            if let brief = calendar.brief, brief.insufficientReason == nil {
+                Button("Edit as my task") { controller.taskDraft = brief.text }
+                    .controlSize(.small)
+                    .help("Copies the brief into the task field; press Start/Use my typed task to apply it as your own")
+            }
+            Spacer()
+            Button("Check now") { calendar.checkNow() }.controlSize(.small)
+        }
+    }
+
+    private var statusColor: Color {
+        switch calendar.status {
+        case .blocked, .degraded, .needsAuthorization: return .orange
+        case .active: return .green
+        default: return .secondary
         }
     }
 }

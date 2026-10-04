@@ -92,4 +92,28 @@ enum WindowLocator {
         }
         return .failure(.noWindow)
     }
+
+    struct StackWindow {
+        let id: CGWindowID
+        let bounds: CGRect
+        let layer: Int
+    }
+
+    /// On-screen windows overlapping the display, front to back (Heads Down's overlay excluded).
+    /// Used to keep covers on windows that are no longer frontmost and to clip them correctly.
+    static func stack(displayID: CGDirectDisplayID, ignoring ignoredWindowIDs: Set<CGWindowID>) -> [StackWindow] {
+        let display = CGDisplayBounds(displayID)
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return list.compactMap { info in
+            guard let number = info[kCGWindowNumber as String] as? CGWindowID,
+                  !ignoredWindowIDs.contains(number),
+                  let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary),
+                  bounds.intersects(display),
+                  (info[kCGWindowAlpha as String] as? Double ?? 1) >= 0.01
+            else { return nil }
+            return StackWindow(id: number, bounds: bounds, layer: (info[kCGWindowLayer as String] as? Int) ?? 0)
+        }
+    }
 }

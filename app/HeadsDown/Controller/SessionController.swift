@@ -6,118 +6,243 @@ struct DisplayChoice: Identifiable, Hashable {
     let name: String
 }
 
-/// Runs the autonomous loop once the user starts a task:
+/// Runs the autonomous loop once the user starts a task. See SessionController+Pipeline.swift for
+/// the tick/cycle pipeline; this file holds state, lifecycle, controls, and the timed pause.
 ///
-///   tick (every 400 ms): locate the target window → small capture → change detection
-///     → hide overlays on changed areas immediately → start a cycle when content settles
-///   cycle (at most one in flight): capture → AX + OCR → merge → segment → reuse cached scores
-///     → classify changed regions in one batch → re-check generations → policy → overlays
+/// Three things are tracked separately:
+/// - observation freshness (thumbnail baseline, dirty reasons, retained OCR),
+/// - semantic decisions (score cache keyed by the exact classifier payload, strict policy),
+/// - visual coverage (a cover drawn from the latest thumbnail, minus chrome/occluders/keep holes).
 ///
-/// This is rule-based orchestration of local tools, not an LLM planner. Every result is checked
-/// against the session, task revision, cycle ID, and window geometry before it is shown, so pausing,
-/// stopping, or a task/window change can never be undone by a late result.
+/// Scrolling is a fourth, geometry-only lane (SessionController+Scroll.swift): covers follow
+/// measured pane movement between reads, and fall back to masking the pane when it can't be measured.
+///
+/// This is rule-based orchestration of local tools, not an LLM planner.
 @MainActor
 final class SessionController: ObservableObject {
     static let shared = SessionController()
 
     static let tickInterval: Duration = .milliseconds(400)
-    static let minCycleInterval: TimeInterval = 1.0
-    static let unsettledCycleInterval: TimeInterval = 3.0
-    static let maxUnsettledWait: TimeInterval = 3.0
+    /// Wait this long after a change (once content is settled) before re-reading.
+    static let debounce: TimeInterval = 0.6
+    /// Never defer a meaningful change longer than this, even if content keeps changing.
+    static let maxDirtyDelay: TimeInterval = 2.0
+    static let minCycleGap: TimeInterval = 0.5
+    /// Animation in covered areas only triggers a recheck this often.
+    static let motionRecheckInterval: TimeInterval = 15
+    static let motionStreakTicks = 3
+    /// More than this fraction of cells changed = layout change (scroll, navigation): close all
+    /// keep holes and re-read the whole window.
+    static let layoutChangeFraction = 0.3
     static let settledChangeFraction = 0.02
-    static let maxClassifierBackoff: TimeInterval = 30
+    /// Above this fraction of the window height in changed bands, OCR the whole window.
+    static let fullOCRBandFraction: CGFloat = 0.5
+    static let maxRetainedOCRAge: TimeInterval = 60
+    /// Paid classification waits until the pointer has stopped scrolling the window this long.
+    static let scrollQuiet: TimeInterval = 0.4
     static let maxCaptureBackoff: TimeInterval = 10
+    /// Scroll tracking cadence while a pane is moving (screenshot path, so a conservative cap).
+    static let trackInterval: TimeInterval = 1.0 / 15
+    /// Keep measuring this long after the last wheel event (momentum and smooth-scroll animations).
+    static let trackQuiet: TimeInterval = 0.5
+    /// After a mid-scroll re-read, newly exposed content that had no score yet stays under the
+    /// transition mask this long (Balanced/Relaxed, panes that had covered content only).
+    static let exposureHoldTime: TimeInterval = 4
+    static let timedPauseChoices = [3, 2]
+    static let maxRetainedWindows = 6
 
     // MARK: - Published state
 
     @Published var taskDraft = ""
-    @Published private(set) var currentTask: String?
-    @Published private(set) var taskRevision = 0
-    @Published private(set) var sessionID: String?
-    @Published var mode: CoverMode = .observe {
-        didSet { if oldValue != mode { modeChanged() } }
+    @Published var currentTask: String?
+    /// Who chose `currentTask`. A typed task always wins; calendar automation only starts, updates,
+    /// or ends sessions it owns (see SessionController+Calendar.swift).
+    @Published var taskSource: TaskSource = .manual
+    @Published var taskRevision = 0
+    @Published var sessionID: String?
+    @Published var mode: CoverMode = CoverMode(rawValue: UserDefaults.standard.string(forKey: "coverMode") ?? "")
+        ?? .blur {
+        didSet {
+            UserDefaults.standard.set(mode.rawValue, forKey: "coverMode")
+            if oldValue != mode { modeChanged() }
+        }
     }
-    @Published var showBoxes = true {
-        didSet { render() }
+    /// Changing strictness re-applies policy to cached scores; nothing is reclassified.
+    @Published var strictness: Strictness = Strictness(
+        rawValue: UserDefaults.standard.string(forKey: "strictness") ?? "") ?? .balanced {
+        didSet {
+            UserDefaults.standard.set(strictness.rawValue, forKey: "strictness")
+            guard oldValue != strictness else { return }
+            rebuildDecisions()
+            render()
+            log(["event": "strictness", "strictness": strictness.rawValue])
+        }
     }
-    @Published private(set) var runState: RunState = .stopped
-    @Published private(set) var activity = "Idle"
-    @Published private(set) var regions: [ScreenRegion] = []
-    @Published private(set) var decisions: [String: RegionDecision] = [:]
-    @Published private(set) var staleRegionIDs: Set<String> = []
-    @Published private(set) var coverage: Coverage?
-    @Published private(set) var lastTimings: CycleTimings?
-    @Published private(set) var classifierStatus = "Not checked"
-    @Published private(set) var screenRecordingGranted = Permissions.screenRecordingGranted
-    @Published private(set) var accessibilityGranted = Permissions.accessibilityGranted
-    @Published private(set) var displays: [DisplayChoice] = []
+    /// Jev (default, after one-time consent) or local Laya. Scores are cached per provider.
+    @Published var provider: ClassifierProvider = SessionController.initialProvider {
+        didSet {
+            guard oldValue != provider else { return }
+            if provider.sendsTextOffDevice, !confirmCloudConsent() {
+                provider = .laya
+                return
+            }
+            UserDefaults.standard.set(provider.rawValue, forKey: "classifierProvider")
+            classifierChanged()
+        }
+    }
+    @Published var showBoxes = UserDefaults.standard.object(forKey: "showBoxes") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(showBoxes, forKey: "showBoxes")
+            render()
+        }
+    }
+    @Published var runState: RunState = .stopped
+    @Published var activity = "Idle"
+    @Published var regions: [ScreenRegion] = []
+    @Published var decisions: [String: RegionDecision] = [:]
+    /// Regions whose pixels changed since they were read. Their keep holes close until re-read.
+    @Published var changedRegionIDs: Set<String> = []
+    /// Regions actually left visible (keep holes) in the last render.
+    @Published var visibleRegionIDs: Set<String> = []
+    @Published var renderedCover = "None"
+    /// Scroll tracking state for the Inspector (session-local pane numbers, no content).
+    @Published var scrollStatus = "Not scrolling"
+    /// Cover image refresh state for the Inspector.
+    @Published var coverStatus = "No cover image"
+    @Published var coverage: Coverage?
+    @Published var lastTimings: CycleTimings?
+    @Published var classifierStatus = "Not checked"
+    /// Per-session classifier usage (requests, tokens, reuse), for the Inspector.
+    @Published var usage = ClassificationStats()
+    @Published var screenRecordingGranted = Permissions.screenRecordingGranted
+    @Published var accessibilityGranted = Permissions.accessibilityGranted
+    @Published var displays: [DisplayChoice] = []
     @Published var selectedDisplayID: CGDirectDisplayID = CGMainDisplayID() {
         didSet { if oldValue != selectedDisplayID { displaySelectionChanged() } }
     }
     @Published var selectedRegionID: String?
-    @Published private(set) var hotKeyStatus = "Not registered"
-    @Published private(set) var notice: String?
+    @Published var hotKeyStatus = "Not registered"
+    @Published var notice: String?
     @Published var diagnosticsEnabled = UserDefaults.standard.object(forKey: "diagnosticsEnabled") as? Bool ?? true {
         didSet { UserDefaults.standard.set(diagnosticsEnabled, forKey: "diagnosticsEnabled") }
     }
+    /// Set while a timed pause is counting down (sleep-aware clock).
+    @Published var pauseDeadline: ContinuousClock.Instant?
 
     var isActive: Bool { [.observing, .processing, .degraded].contains(runState) }
+    var controlCount: Int { controlRects.count }
     var classifierEndpoint: String { classifier.endpointDescription }
+    var classifierName: String { classifier.displayName }
+
+    static let jevConsentKey = "jevConsent"
+    static var initialProvider: ClassifierProvider {
+        let saved = ClassifierProvider(rawValue: UserDefaults.standard.string(forKey: "classifierProvider") ?? "") ?? .jev
+        // Never start on a cloud provider without recorded consent.
+        return saved == .jev && !UserDefaults.standard.bool(forKey: jevConsentKey) ? .laya : saved
+    }
+
+    static func makeClassifier(_ provider: ClassifierProvider) -> DistractionClassifier {
+        switch provider {
+        case .jev: return JevClient()
+        case .laya: return LayaClient()
+        }
+    }
 
     var menuBarSymbol: String {
         switch runState {
         case .stopped: return "eye"
         case .requestingPermissions: return "lock.shield"
-        case .paused: return "pause.circle"
+        case .paused: return pauseDeadline == nil ? "pause.circle" : "timer"
         case .degraded: return "exclamationmark.triangle"
         case .observing, .processing: return "eye.circle.fill"
         }
     }
 
-    // MARK: - Private state
-
-    private let classifier: DistractionClassifier = LayaClient()
-    private let capturer = ScreenCapturer()
-    private let overlay = OverlayController()
-    private let overrides = RevealOverrides()
-    private var scoreCache = ScoreCache(limit: 1000)
-    private var observers: [NSObjectProtocol] = []
-
-    private var loopTask: Task<Void, Never>?
-    private var cycleTask: Task<Void, Never>?
-    private var sessionGeneration: UInt64 = 0
-    private var cycleCounter: UInt64 = 0
-    private var activeCycleID: UInt64 = 0
-
-    private var target: TargetWindow?
-    /// Thumbnail matching the frame the current regions came from.
-    private var baseline: Thumbnail?
-    private var latestThumb: Thumbnail?
-    private var latestThumbAt = Date.distantPast
-    private var unsettledSince: Date?
-    private var changeDetectedAt: Date?
-    private var needsAnalysis = true
-    private var lastCycleStart = Date.distantPast
-
-    /// Only the most recent frame is kept, for blur crops. Released on invalidation and stop.
-    private var lastSnapshot: ScreenSnapshot?
-    private var blurCache: [String: CGImage] = [:]
-
-    private var captureProblem: String?
-    private var captureRetryAt = Date.distantPast
-    private var captureBackoff: TimeInterval = 1
-    private var classifierProblem: String?
-    private var classifierRetryAt = Date.distantPast
-    private var classifierBackoff: TimeInterval = 2
-
-    private struct CycleContext {
-        let id: UInt64
-        let session: UInt64
-        let revision: Int
-        let task: String
-        let target: TargetWindow
-        let changeAt: Date?
+    /// Remaining timed-pause time, derived from the deadline (never a decremented counter).
+    var pauseRemaining: Duration? {
+        guard let pauseDeadline else { return nil }
+        return max(.zero, pauseDeadline - ContinuousClock.now)
     }
+
+    // MARK: - Pipeline state (internal for SessionController+Pipeline.swift)
+
+    /// Owns when classifier requests are sent; see ClassificationScheduler.swift.
+    let scheduler = ClassificationScheduler(classifier: SessionController.makeClassifier(SessionController.initialProvider))
+    var classifier: DistractionClassifier { scheduler.classifier }
+    let capturer = ScreenCapturer()
+    let overlay = OverlayController()
+    let coverQueue = CoverRenderQueue()
+    /// Blurs of scrolled panes from tracking captures; separate so they never delay the window cover.
+    let paneCoverQueue = CoverRenderQueue()
+    let overrides = RevealOverrides()
+    var scoreCache = ScoreCache(limit: 2000)
+    var observers: [NSObjectProtocol] = []
+    var scrollMonitor: Any?
+
+    var loopTask: Task<Void, Never>?
+    /// The single expensive-work lane (capture/AX/OCR/classify). Cleared only when the work
+    /// really finishes, so superseded work can't overlap a new cycle.
+    var laneTask: Task<Void, Never>?
+    var autoResumeTask: Task<Void, Never>?
+    var sessionGeneration: UInt64 = 0
+    var cycleCounter: UInt64 = 0
+    var activeCycleID: UInt64 = 0
+    var pauseToken: UInt64 = 0
+
+    var target: TargetWindow?
+    var chrome: ContentEnvelope.Chrome?
+    /// Interactive controls from the last accessibility read; never covered.
+    var controlRects: [CGRect] = []
+    /// Covers kept on windows that are no longer frontmost but still visible.
+    var retainedWindows: [CGWindowID: RetainedWindow] = [:]
+    /// Thumbnail matching the frame the current regions/OCR came from.
+    var baseline: Thumbnail?
+    var latestThumb: Thumbnail?
+    /// When the latest thumbnail's capture started.
+    var latestThumbAt = Date.distantPast
+    var motionStreak: [Int] = []
+    var settled = false
+    var coverImage: CGImage?
+    /// When the source of `coverImage` was captured; maps it to scroll displacement.
+    var coverImageAt = Date.distantPast
+    /// Average color of the cover source, used for gaps (just-exposed strips) instead of a dark fill.
+    var coverFill: CGColor?
+    /// Fresher blurred captures of scrolled panes, by tracker ID.
+    var paneCovers: [Int: (image: CGImage, rect: CGRect, capturedAt: Date)] = [:]
+    var layoutChanged = false
+    var dirtyReasons: Set<DirtyReason> = []
+    var dirtySince: Date?
+    var lastScrollAt = Date.distantPast
+    /// Scrolling containers from the last committed AX read.
+    var scrollPanes: [ScrollPane] = []
+    /// Panes scrolled since the last committed read, with their measured displacement.
+    var trackers: [PaneTracker] = []
+    var trackerCounter = 0
+    /// Whole visible area at tracking scale, from the frame the current regions were read from.
+    var trackingReference: TrackFrame?
+    var trackTask: Task<Void, Never>?
+    var trackLoopToken: UInt64 = 0
+    var trackStats = TrackStats()
+    /// Areas whose new, unscored content stays masked briefly after a mid-scroll re-read.
+    var exposureHold: (areas: [CGRect], until: Date)?
+    var lastCycleStart = Date.distantPast
+    var retainedOCR: [TextObservation] = []
+    var lastFullOCRAt = Date.distantPast
+
+    /// Calendar automation hooks. User actions report here so a stop or indefinite pause can't be
+    /// undone by the next calendar poll.
+    var onUserStop: (() -> Void)?
+    var onIndefinitePause: (() -> Void)?
+    var onUserResume: (() -> Void)?
+    /// Re-resolves a calendar-owned session's event before a timed pause resumes it.
+    var revalidateCalendarResume: ((CalendarOccurrence) async -> Bool)?
+    /// Set while a calendar start is checking capture access, so it doesn't count as a manual session.
+    var pendingCalendarStart: CalendarOccurrence?
+
+    var captureProblem: String?
+    var captureRetryAt = Date.distantPast
+    var captureBackoff: TimeInterval = 1
+    var classifierProblem: String?
 }
 
 // MARK: - Setup
@@ -125,6 +250,25 @@ final class SessionController: ObservableObject {
 extension SessionController {
     func setUp() {
         refreshDisplays()
+        scheduler.onScores = { [weak self] in self?.scoresArrived($0) }
+        scheduler.onProblem = { [weak self] in self?.classifierProblemChanged($0) }
+        scheduler.onStatsChanged = { [weak self] in
+            guard let self else { return }
+            self.usage = self.scheduler.stats
+        }
+        scheduler.onRequestLogged = { [weak self] in self?.log($0) }
+        scheduler.onIdentityChanged = { [weak self] in
+            guard let self else { return }
+            // Old cache entries no longer match the provider identity; affected regions re-score.
+            self.rebuildDecisions()
+            self.render()
+            self.syncClassification()
+            self.log(["event": "classifier_model_changed", "provider": self.classifier.providerID])
+        }
+        scheduler.gateDelay = { [weak self] in self?.classificationGateDelay() }
+        coverQueue.onImage = { [weak self] in self?.coverArrived($0, tag: $1) }
+        paneCoverQueue.onImage = { [weak self] in self?.coverArrived($0, tag: $1) }
+        Task.detached(priority: .utility) { OCRRecognizer.prewarm() }
         let pauseOK = HotKeys.shared.register(HotKeys.pause) { [weak self] in
             MainActor.assumeIsolated { self?.togglePause() }
         }
@@ -153,6 +297,12 @@ extension SessionController {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.screensChanged() }
         })
+        // Scrolling over the target starts geometry tracking for the pane under the pointer,
+        // before pixels are compared. Mouse-event monitors don't need Input Monitoring; if macOS
+        // withholds events, a large thumbnail change starts tracking a tick later.
+        scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] _ in
+            MainActor.assumeIsolated { self?.userScrolled() }
+        }
     }
 
     func refreshPermissions() {
@@ -160,18 +310,21 @@ extension SessionController {
         if Permissions.screenRecordingGranted { screenRecordingGranted = true }
     }
 
+    /// Also the way to resume sending after fixing a rejected or missing API key.
     func refreshClassifierHealth() {
         Task {
             classifierStatus = "Checking…"
-            classifierStatus = await classifier.health().label
+            let health = await classifier.health()
+            classifierStatus = health.label
+            if health == .ready { scheduler.clearAuthBlock() }
         }
     }
-
 }
 
 // MARK: - User controls
 
 extension SessionController {
+    /// Start a session, or apply an edited task. Editing the task while paused stays paused.
     func start() {
         let task = taskDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !task.isEmpty else {
@@ -180,30 +333,87 @@ extension SessionController {
         }
         notice = nil
         if isActive || runState == .paused {
+            // Applying a typed task to a calendar-started session is a manual takeover: the event
+            // ending no longer ends it.
+            let takeover = taskSource != .manual
             if task != currentTask { changeTask(to: task) }
-            if runState == .paused { resume() }
+            if takeover {
+                taskSource = .manual
+                log(["event": "calendar_takeover"])
+            }
             return
         }
         guard runState != .requestingPermissions else { return }
+        // Jev is the default, but nothing leaves the Mac until the user agrees once.
+        let savedProvider = ClassifierProvider(rawValue: UserDefaults.standard.string(forKey: "classifierProvider") ?? "")
+        if provider == .laya, savedProvider ?? .jev == .jev, !UserDefaults.standard.bool(forKey: Self.jevConsentKey) {
+            provider = .jev
+        }
         runState = .requestingPermissions
         activity = "Checking Screen Recording permission"
         Task { await beginSession(task: task) }
     }
 
+    /// Emergency toggle (⌃⌥⌘P and the Pause button): indefinite pause, or resume from any pause.
     func togglePause() {
         if runState == .paused { resume() } else if isActive { pause() }
     }
 
+    /// Indefinite pause. Clears every overlay immediately. Calendar auto-start also waits until
+    /// the user resumes.
     func pause() {
-        guard isActive else { return }
-        endWork()
-        runState = .paused
+        guard isActive || runState == .paused else { return }
+        onIndefinitePause?()
+        cancelTimedPause()
+        if isActive {
+            endWork()
+            runState = .paused
+        }
         activity = "Paused — nothing is covered"
-        log(["event": "pause"])
+        log(["event": "pause", "kind": "indefinite"])
     }
 
+    /// Timed pause with automatic resume. A new timed pause replaces any previous deadline.
+    func pause(minutes: Int) {
+        guard isActive || runState == .paused else { return }
+        if isActive {
+            endWork()
+            runState = .paused
+        }
+        cancelTimedPause()
+        pauseToken += 1
+        let token = pauseToken
+        let deadline = ContinuousClock.now + .seconds(minutes * 60)
+        pauseDeadline = deadline
+        activity = "Paused for \(minutes) min — nothing is covered"
+        // Owned by the controller, not the menu panel, so it fires with the panel closed.
+        // ContinuousClock keeps counting during sleep; an elapsed deadline fires once after wake.
+        autoResumeTask = Task { [weak self] in
+            try? await Task.sleep(until: deadline, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            self?.autoResume(token: token)
+        }
+        log(["event": "pause", "kind": "timed", "minutes": minutes])
+    }
+
+    /// Converts a timed pause into an indefinite one.
+    func stayPaused() {
+        guard runState == .paused else { return }
+        cancelTimedPause()
+        activity = "Paused — nothing is covered"
+        log(["event": "stay_paused"])
+    }
+
+    /// User resume (button, shortcut).
     func resume() {
         guard runState == .paused, currentTask != nil else { return }
+        onUserResume?()
+        resumeSession()
+    }
+
+    private func resumeSession() {
+        guard runState == .paused, currentTask != nil else { return }
+        cancelTimedPause()
         runState = .observing
         activity = "Resuming"
         overlay.show(displayID: selectedDisplayID)
@@ -211,8 +421,18 @@ extension SessionController {
         log(["event": "resume"])
     }
 
-    func stop() {
+    enum StopCause {
+        /// The user pressed Stop: calendar automation skips the current event(s).
+        case user
+        case quit
+        /// The calendar event that owned the session ended, changed, or became unavailable.
+        case calendar(String)
+    }
+
+    func stop(cause: StopCause = .user) {
         guard runState != .stopped else { return }
+        if case .user = cause { onUserStop?() }
+        cancelTimedPause()
         endWork()
         overlay.hide()
         runState = .stopped
@@ -221,8 +441,15 @@ extension SessionController {
         overrides.clear()
         scoreCache.removeAll()
         coverage = nil
-        activity = "Stopped"
-        log(["event": "stop"])
+        taskSource = .manual
+        switch cause {
+        case .user, .quit:
+            activity = "Stopped"
+            log(["event": "stop"])
+        case .calendar(let reason):
+            activity = "Calendar session ended: \(reason)"
+            log(["event": "calendar_end", "reason": reason])
+        }
     }
 
     func reveal(regionID: String) {
@@ -239,25 +466,60 @@ extension SessionController {
         overrides.unreveal(revision: taskRevision, fingerprint: region.fingerprint)
         rebuildDecisions()
         render()
-        if mode == .blur { Task { await prepareBlurCrops(); render() } }
     }
 
     func revealExpiry(for region: ScreenRegion) -> Date? {
         overrides.expiry(revision: taskRevision, fingerprint: region.fingerprint)
     }
 
-    /// Reveals the smallest covered region under the mouse pointer. Works without clicking the
+    /// Reveals the smallest covered region under the mouse pointer, without clicking the
     /// click-through overlay.
     func revealUnderPointer() {
         guard isActive else { return }
         let point = Geometry.appKitPointToQuartz(NSEvent.mouseLocation)
-        let hits = regions.filter { !staleRegionIDs.contains($0.id) && $0.rect.contains(point) }
-        let covered = hits.filter { decisions[$0.id]?.action != .leave }
+        let hits = regions.filter { currentRect($0.rect)?.contains(point) == true }
+        let covered = hits.filter { !visibleRegionIDs.contains($0.id) }
         guard let region = (covered.isEmpty ? hits : covered).min(by: { $0.rect.area < $1.rect.area }) else {
-            notice = "No region under the pointer."
+            notice = "No region under the pointer. Text-free areas can't be revealed individually; pause instead."
             return
         }
         reveal(regionID: region.id)
+    }
+
+    /// One-time notice before any screen text goes to a hosted classifier.
+    func confirmCloudConsent() -> Bool {
+        if UserDefaults.standard.bool(forKey: Self.jevConsentKey) { return true }
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.messageText = "Send screen text to Jev?"
+        alert.informativeText = """
+            Jev runs on TypeSafe's servers (api.typesafe.ai). While Heads Down is active, it sends \
+            the text of each region it reads from the front window, plus the app name, window \
+            title, and your task, for scoring. If you turn on Google Calendar auto-start, the task \
+            can come from your current calendar event (sanitized title and agenda). Screenshots are \
+            never sent. Usage is billed to the \
+            API key in your .env.
+
+            Laya (local) keeps everything on this Mac but is less accurate. You can switch any \
+            time in the menu-bar panel.
+            """
+        alert.addButton(withTitle: "Use Jev")
+        alert.addButton(withTitle: "Use Laya (local)")
+        let accepted = alert.runModal() == .alertFirstButtonReturn
+        if accepted { UserDefaults.standard.set(true, forKey: Self.jevConsentKey) }
+        log(["event": "cloud_consent", "accepted": accepted])
+        return accepted
+    }
+
+    private func classifierChanged() {
+        scheduler.replace(classifier: Self.makeClassifier(provider))
+        classifierProblem = nil
+        updateRunState()
+        rebuildDecisions()
+        render()
+        syncClassification()
+        refreshClassifierHealth()
+        log(["event": "classifier", "provider": classifier.providerID])
     }
 
     func deleteDiagnostics() {
@@ -266,7 +528,6 @@ extension SessionController {
     }
 
     var diagnosticsPath: String { DiagnosticsLog.shared.url.path }
-
 }
 
 // MARK: - Session lifecycle
@@ -291,44 +552,85 @@ extension SessionController {
             notice = "Accessibility not granted: running OCR-only. Grant it in System Settings for structured reads."
         }
         accessibilityGranted = Permissions.accessibilityGranted
+        activate(task: task, source: .manual)
+    }
 
+    /// Starts the loop for `task`. Callers have already checked permissions and consent; this never
+    /// prompts, so the calendar path can use it. `taskDraft` is left alone.
+    func activate(task: String, source: TaskSource) {
+        cancelTimedPause()
         sessionID = String(UUID().uuidString.prefix(8))
         currentTask = task
+        taskSource = source
         taskRevision += 1
         overrides.clear()
         scoreCache.removeAll()
+        scheduler.resetStats()
+        scheduler.clearAuthBlock()
         runState = .observing
         activity = "Looking for the front window"
         overlay.show(displayID: selectedDisplayID)
         beginLoop()
         refreshClassifierHealth()
-        log(["event": "start", "ax": accessibilityGranted])
+        log(["event": "start", "ax": accessibilityGranted, "mode": mode.rawValue,
+             "source": source == .manual ? "manual" : "calendar"])
     }
 
-    private func changeTask(to task: String) {
+    /// A new task invalidates every decision, but not the screen reading: regions stay, their
+    /// scores become pending (covered), and only classification reruns.
+    func changeTask(to task: String) {
         currentTask = task
         taskRevision += 1
         scoreCache.removeAll()
         overrides.clear()
-        // A new task invalidates every decision, even if the screen text is unchanged.
-        invalidateAll()
-        activity = "Task changed — rechecking"
+        retainedWindows = [:]
+        rebuildDecisions()
+        render()
+        syncClassification()
+        activity = runState == .paused ? "Task updated — still paused" : "Task changed — rechecking"
         log(["event": "task_changed"])
     }
 
-    private func beginLoop() {
+    /// A timed pause ending. A calendar-owned session is resumed only if its event is still current
+    /// and eligible; it's never resurrected after the event ended or was cancelled.
+    private func autoResume(token: UInt64) {
+        guard token == pauseToken, runState == .paused, pauseDeadline != nil, currentTask != nil else { return }
+        guard let occurrence = taskSource.occurrence, let revalidate = revalidateCalendarResume else {
+            log(["event": "auto_resume"])
+            resumeSession()
+            return
+        }
+        Task {
+            let stillCurrent = await revalidate(occurrence)
+            guard token == self.pauseToken, self.runState == .paused, self.taskSource.occurrence == occurrence else {
+                return
+            }
+            if stillCurrent {
+                self.log(["event": "auto_resume"])
+                self.resumeSession()
+            } else {
+                self.stop(cause: .calendar("event no longer current"))
+            }
+        }
+    }
+
+    func cancelTimedPause() {
+        autoResumeTask?.cancel()
+        autoResumeTask = nil
+        pauseToken += 1
+        pauseDeadline = nil
+    }
+
+    func beginLoop() {
         sessionGeneration += 1
         let session = sessionGeneration
         target = nil
         invalidateAll()
-        unsettledSince = nil
         lastCycleStart = .distantPast
         captureProblem = nil
         captureRetryAt = .distantPast
         captureBackoff = 1
         classifierProblem = nil
-        classifierRetryAt = .distantPast
-        classifierBackoff = 2
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.sessionGeneration == session else { return }
@@ -338,33 +640,54 @@ extension SessionController {
         }
     }
 
-    /// Cancels all work and clears overlays immediately. Late results are rejected because the
-    /// session generation no longer matches.
-    private func endWork() {
+    /// Cancels the loop and clears overlays immediately. Late results are rejected because the
+    /// session generation no longer matches. Scores and reveals are kept for resume.
+    func endWork() {
         sessionGeneration += 1
         loopTask?.cancel()
         loopTask = nil
+        scheduler.stopAll()
+        retainedWindows = [:]
         invalidateAll()
         target = nil
         captureProblem = nil
         classifierProblem = nil
     }
 
-    /// Drops all geometry-dependent state and clears overlays right away.
-    private func invalidateAll() {
-        cycleTask?.cancel()
-        cycleTask = nil
+    /// Drops all geometry-dependent state and clears overlays right away. The lane task is
+    /// cancelled but stays registered until it actually finishes.
+    func invalidateAll() {
+        laneTask?.cancel()
         activeCycleID = 0
         regions = []
         decisions = [:]
-        staleRegionIDs = []
-        blurCache = [:]
-        lastSnapshot = nil
+        changedRegionIDs = []
+        visibleRegionIDs = []
         baseline = nil
         latestThumb = nil
-        needsAnalysis = true
-        changeDetectedAt = Date()
+        motionStreak = []
+        settled = false
+        coverImage = nil
+        coverImageAt = .distantPast
+        coverFill = nil
+        paneCovers = [:]
+        coverQueue.cancelAll()
+        paneCoverQueue.cancelAll()
+        coverStatus = "No cover image yet — neutral placeholder"
+        layoutChanged = false
+        stopTracking()
+        scrollPanes = []
+        trackingReference = nil
+        exposureHold = nil
+        retainedOCR = []
+        lastFullOCRAt = .distantPast
+        controlRects = []
+        dirtyReasons = [.newTarget]
+        dirtySince = Date()
+        renderedCover = "None"
         overlay.clear()
+        // Inputs from the old geometry that haven't been sent yet are no longer useful.
+        syncClassification()
     }
 
     private func environmentChanged(_ reason: String) {
@@ -383,6 +706,7 @@ extension SessionController {
 
     private func displaySelectionChanged() {
         guard isActive else { return }
+        retainedWindows = [:]
         invalidateAll()
         target = nil
         overlay.show(displayID: selectedDisplayID)
@@ -395,508 +719,40 @@ extension SessionController {
         }
     }
 
-    private func displayName(_ id: CGDirectDisplayID) -> String {
+    func displayName(_ id: CGDirectDisplayID) -> String {
         displays.first { $0.id == id }?.name ?? "Display \(id)"
     }
 
-    private func updateRunState() {
+    func updateRunState() {
         guard isActive else { return }
         if captureProblem != nil || classifierProblem != nil {
             runState = .degraded
         } else {
-            runState = cycleTask == nil ? .observing : .processing
+            runState = laneTask == nil ? .observing : .processing
         }
-    }
-
-}
-
-// MARK: - Tick: window tracking and change detection
-
-extension SessionController {
-    private func tick(session: UInt64) async {
-        guard session == sessionGeneration, isActive else { return }
-        switch WindowLocator.locate(displayID: selectedDisplayID, ignoring: overlay.windowIDs) {
-        case .failure(let skip):
-            if target != nil || coverage?.skipReason != skip.message {
-                invalidateAll()
-                target = nil
-                coverage = Coverage(displayName: displayName(selectedDisplayID), skipReason: skip.message)
-                activity = skip.message
-            }
-            return
-        case .success(let found):
-            if let current = target, current.sameGeometry(as: found) {
-                target = found
-            } else {
-                let hadTarget = target != nil
-                invalidateAll()
-                target = found
-                coverage = Coverage(
-                    appName: found.appName, windowTitle: found.title, windowID: found.windowID,
-                    displayName: displayName(found.displayID), bounds: found.visibleRect,
-                    skippedAreas: describeSkipped(found))
-                unsettledSince = Date()
-                activity = hadTarget ? "Window changed — waiting for it to settle" : "Found \(found.appName) window"
-            }
-        }
-
-        guard let current = target, Date() >= captureRetryAt else { return }
-        let thumb: Thumbnail
-        do {
-            let (image, _) = try await capturer.capture(
-                rect: current.visibleRect, displayID: current.displayID, pixelsPerPoint: thumbScale(current))
-            guard let made = Thumbnail(image: image, rect: current.visibleRect) else { return }
-            thumb = made
-        } catch {
-            if session == sessionGeneration, isActive { handleCaptureFailure(error) }
-            return
-        }
-        guard session == sessionGeneration, isActive, let now = target, now.sameGeometry(as: current) else { return }
-        clearCaptureProblem()
-
-        let previous = latestThumb
-        latestThumb = thumb
-        latestThumbAt = Date()
-        if let previous, thumb.diff(against: previous).changedFraction < Self.settledChangeFraction {
-            unsettledSince = nil
-        } else if unsettledSince == nil {
-            unsettledSince = Date()
-        }
-
-        if let baseline {
-            let diff = thumb.diff(against: baseline)
-            if diff.changedRects.isEmpty {
-                if !staleRegionIDs.isEmpty {
-                    staleRegionIDs = []
-                    render()
-                }
-            } else {
-                if changeDetectedAt == nil { changeDetectedAt = Date() }
-                needsAnalysis = true
-                let stale = staleIDs(for: diff.changedRects)
-                if stale != staleRegionIDs {
-                    staleRegionIDs = stale
-                    render()
-                }
-            }
-        }
-        maybeStartCycle(current)
-    }
-
-    private func maybeStartCycle(_ current: TargetWindow) {
-        guard cycleTask == nil, currentTask != nil else { return }
-        let retryDue = classifierProblem != nil && Date() >= classifierRetryAt
-            && regions.contains { scoreCache[cacheKey($0, revision: taskRevision)] == nil }
-        guard needsAnalysis || retryDue else { return }
-        let settled = unsettledSince == nil
-        let interval = settled ? Self.minCycleInterval : Self.unsettledCycleInterval
-        guard Date().timeIntervalSince(lastCycleStart) >= interval else { return }
-        if !settled, let since = unsettledSince, Date().timeIntervalSince(since) < Self.maxUnsettledWait {
-            activity = "Waiting for content to settle"
-            return
-        }
-        startCycle(target: current)
-    }
-
-    private func staleIDs(for changed: [CGRect]) -> Set<String> {
-        Set(regions.filter { region in
-            let inner = region.rect.insetBy(dx: 2, dy: 2)
-            return changed.contains { $0.intersects(inner) }
-        }.map(\.id))
-    }
-
-    private func thumbScale(_ target: TargetWindow) -> CGFloat {
-        CGFloat(Thumbnail.width) / max(1, target.visibleRect.width)
-    }
-
-}
-
-// MARK: - Cycle: read, group, classify, apply
-
-extension SessionController {
-    private func startCycle(target: TargetWindow) {
-        guard let task = currentTask else { return }
-        cycleCounter += 1
-        let context = CycleContext(
-            id: cycleCounter, session: sessionGeneration, revision: taskRevision, task: task,
-            target: target, changeAt: changeDetectedAt)
-        activeCycleID = context.id
-        lastCycleStart = Date()
-        needsAnalysis = false
-        changeDetectedAt = nil
-        cycleTask = Task { [weak self] in
-            await self?.runCycle(context)
-            guard let self, self.activeCycleID == context.id else { return }
-            self.cycleTask = nil
-            self.updateRunState()
-        }
-        updateRunState()
-    }
-
-    private func isCurrent(_ context: CycleContext) -> Bool {
-        guard !Task.isCancelled, isActive, context.session == sessionGeneration,
-              context.revision == taskRevision, context.id == activeCycleID,
-              let target, target.sameGeometry(as: context.target)
-        else { return false }
-        return true
-    }
-
-    // swiftlint:disable:next function_body_length
-    private func runCycle(_ context: CycleContext) async {
-        var timings = CycleTimings(cycleID: context.id)
-        let started = Date()
-        if let changeAt = context.changeAt { timings.queueMs = started.timeIntervalSince(changeAt) * 1000 }
-        let target = context.target
-        activity = "Reading screen"
-
-        // 1. Capture a change-detection baseline and the full frame back to back.
-        let captureStart = Date()
-        let scale = Geometry.backingScale(for: target.displayID)
-        let baseThumb: Thumbnail
-        let snapshot: ScreenSnapshot
-        do {
-            let (small, _) = try await capturer.capture(
-                rect: target.visibleRect, displayID: target.displayID, pixelsPerPoint: thumbScale(target))
-            let (full, geometry) = try await capturer.capture(
-                rect: target.visibleRect, displayID: target.displayID, pixelsPerPoint: scale)
-            guard let thumb = Thumbnail(image: small, rect: target.visibleRect) else { return }
-            baseThumb = thumb
-            snapshot = ScreenSnapshot(cycleID: context.id, capturedAt: Date(), geometry: geometry, image: full)
-        } catch {
-            if isCurrent(context) { handleCaptureFailure(error) }
-            return
-        }
-        timings.captureMs = elapsedMs(since: captureStart)
-        guard isCurrent(context) else { return }
-        clearCaptureProblem()
-
-        // 2. Accessibility (bounded) and OCR in parallel, off the main actor.
-        let axAllowed = Permissions.accessibilityGranted
-        accessibilityGranted = axAllowed
-        activity = axAllowed ? "Reading accessibility tree + OCR" : "Running OCR (no accessibility)"
-        let cycleID = context.id
-        let axJob = Task.detached(priority: .userInitiated) { () -> (AXReadResult, Double) in
-            let start = Date()
-            let result = axAllowed
-                ? AccessibilityReader.read(target: target, generation: cycleID)
-                : AXReadResult(status: "Accessibility not granted")
-            return (result, elapsedMs(since: start))
-        }
-        let ocrJob = Task.detached(priority: .userInitiated) { () -> (Result<[TextObservation], Error>, Double) in
-            let start = Date()
-            let result = Result {
-                try OCRRecognizer.recognize(
-                    image: snapshot.image, geometry: snapshot.geometry, windowID: target.windowID, generation: cycleID)
-            }
-            return (result, elapsedMs(since: start))
-        }
-        let (axResult, axMs) = await axJob.value
-        let (ocrResult, ocrMs) = await ocrJob.value
-        timings.axMs = axMs
-        timings.ocrMs = ocrMs
-        guard isCurrent(context) else { return }
-        var notes: [String] = []
-        let ocrLines: [TextObservation]
-        switch ocrResult {
-        case .success(let lines): ocrLines = lines
-        case .failure(let error):
-            ocrLines = []
-            notes.append("OCR failed: \(error.localizedDescription)")
-        }
-
-        // 3. Merge sources and group into regions.
-        activity = "Grouping text into regions"
-        let groupStart = Date()
-        let occluderRects = target.occluders.map(\.rect)
-        let (segmentation, stats) = await Task.detached(priority: .userInitiated) {
-            let (merged, stats) = ObservationMerger.merge(
-                accessibility: axResult.texts, ocr: ocrLines, visibleRect: target.visibleRect, occluders: occluderRects)
-            let output = Segmenter.segment(SegmentationInput(
-                observations: merged, containers: axResult.containers, visibleRect: target.visibleRect,
-                occluders: occluderRects, appName: target.appName, windowTitle: target.title,
-                windowID: target.windowID))
-            return (output, stats)
-        }.value
-        timings.groupMs = elapsedMs(since: groupStart)
-        timings.axNodes = axResult.nodesVisited
-        timings.axTexts = axResult.texts.count
-        timings.ocrLines = ocrLines.count
-        timings.regionCount = segmentation.regions.count
-        guard isCurrent(context) else { return }
-
-        regions = segmentation.regions
-        baseline = baseThumb
-        lastSnapshot = snapshot
-        blurCache = [:]
-        staleRegionIDs = changedSince(baseThumb, capturedAt: snapshot.capturedAt)
-        if let selected = selectedRegionID, !regions.contains(where: { $0.id == selected }) { selectedRegionID = nil }
-        updateCoverage(target: target, ax: axResult, stats: stats, segmentation: segmentation, notes: notes)
-        rebuildDecisions()
-        render()
-
-        // 4. Classify only regions without a cached score for this task/provider/question/content.
-        var errorCategory: String?
-        let pending = regions.filter { scoreCache[cacheKey($0, revision: context.revision)] == nil }
-        timings.cachedCount = regions.count - pending.count
-        if !pending.isEmpty, Date() >= classifierRetryAt {
-            activity = "Checking \(pending.count) changed region\(pending.count == 1 ? "" : "s")"
-            let classifyStart = Date()
-            do {
-                let inputs = pending.map { ClassifierInput(app: $0.appName, title: $0.windowTitle, text: $0.text) }
-                let scores = try await classifier.classify(task: context.task, regions: inputs)
-                timings.classifyMs = elapsedMs(since: classifyStart)
-                guard context.session == sessionGeneration, context.revision == taskRevision else { return }
-                for (region, score) in zip(pending, scores) {
-                    if let value = score.pDistracting {
-                        scoreCache.set(cacheKey(region, revision: context.revision), value)
-                    }
-                }
-                timings.classifiedCount = scores.filter { $0.pDistracting != nil }.count
-                classifierProblem = nil
-                classifierBackoff = 2
-                classifierStatus = "Ready"
-            } catch {
-                timings.classifyMs = elapsedMs(since: classifyStart)
-                guard context.session == sessionGeneration else { return }
-                let described = (error as? ClassifierError)?.errorDescription ?? error.localizedDescription
-                errorCategory = (error as? ClassifierError)?.category ?? "other"
-                classifierProblem = "Paused covering: \(described)"
-                classifierRetryAt = Date().addingTimeInterval(classifierBackoff)
-                classifierStatus = "Unavailable (\(described)); retry in \(Int(classifierBackoff)) s"
-                classifierBackoff = min(classifierBackoff * 2, Self.maxClassifierBackoff)
-            }
-        }
-        guard isCurrent(context) else { return }
-
-        // 5. Re-check geometry against the newest thumbnail, then apply.
-        staleRegionIDs = changedSince(baseThumb, capturedAt: snapshot.capturedAt)
-        rebuildDecisions()
-        if mode == .blur {
-            let blurStart = Date()
-            await prepareBlurCrops()
-            timings.blurMs = elapsedMs(since: blurStart)
-            guard isCurrent(context) else { return }
-        }
-        render()
-
-        timings.totalMs = elapsedMs(since: started)
-        timings.captureToOverlayMs = elapsedMs(since: snapshot.capturedAt)
-        timings.changeToOverlayMs = context.changeAt.map { elapsedMs(since: $0) }
-        lastTimings = timings
-        activity = classifierProblem ?? summaryActivity()
-        logCycle(context: context, timings: timings, axUsed: stats.axKept > 0, error: errorCategory)
-    }
-
-    /// Regions whose area changed between their capture and the newest thumbnail.
-    private func changedSince(_ base: Thumbnail, capturedAt: Date) -> Set<String> {
-        guard let latest = latestThumb, latestThumbAt > capturedAt else { return [] }
-        let diff = latest.diff(against: base)
-        if !diff.changedRects.isEmpty {
-            needsAnalysis = true
-            if changeDetectedAt == nil { changeDetectedAt = latestThumbAt }
-        }
-        return staleIDs(for: diff.changedRects)
-    }
-
-    private func cacheKey(_ region: ScreenRegion, revision: Int) -> String {
-        ScoreCache.key(
-            revision: revision, provider: classifier.providerID, question: classifier.questionVersion,
-            input: region.classifierFingerprint)
-    }
-
-    private func handleCaptureFailure(_ error: Error) {
-        invalidateAll()
-        captureRetryAt = Date().addingTimeInterval(captureBackoff)
-        captureBackoff = min(captureBackoff * 2, Self.maxCaptureBackoff)
-        let permissionHint = Permissions.screenRecordingGranted ? "" : " (Screen Recording may be off)"
-        captureProblem = "Screen capture unavailable\(permissionHint): \(error.localizedDescription)"
-        activity = captureProblem ?? ""
-        updateRunState()
-        Task { await capturer.invalidate() }
-        log(["event": "capture_error", "error": String(describing: type(of: error))])
-    }
-
-    private func clearCaptureProblem() {
-        guard captureProblem != nil else { return }
-        captureProblem = nil
-        captureBackoff = 1
-        updateRunState()
-    }
-
-}
-
-// MARK: - Policy and rendering
-
-extension SessionController {
-    private func rebuildDecisions() {
-        let cycleID = lastSnapshot?.cycleID ?? 0
-        var result: [String: RegionDecision] = [:]
-        for region in regions {
-            let score = scoreCache[cacheKey(region, revision: taskRevision)]
-            let revealed = overrides.isRevealed(revision: taskRevision, fingerprint: region.fingerprint)
-            let applied = Policy.applied(
-                score: score, mode: mode, geometryUncertain: region.geometryUncertain, revealed: revealed)
-            result[region.id] = RegionDecision(
-                regionID: region.id, fingerprint: region.fingerprint, taskRevision: taskRevision,
-                cycleID: cycleID, providerID: classifier.providerID, questionVersion: classifier.questionVersion,
-                pDistracting: score, tier: Policy.tier(for: score), action: applied.action,
-                overridden: revealed, policyNote: applied.note, decidedAt: Date())
-        }
-        decisions = result
     }
 
     private func modeChanged() {
-        rebuildDecisions()
         render()
-        if mode == .blur {
-            Task {
-                await prepareBlurCrops()
-                render()
-            }
-        }
         log(["event": "mode", "mode": mode.rawValue])
     }
 
-    private func prepareBlurCrops() async {
-        guard mode == .blur, let snapshot = lastSnapshot else { return }
-        let jobs = regions
-            .filter { decisions[$0.id]?.action == .blur && blurCache[$0.id] == nil }
-            .map { ($0.id, $0.rect) }
-        guard !jobs.isEmpty else { return }
-        let rendered = await Task.detached(priority: .userInitiated) {
-            jobs.compactMap { id, rect in
-                BlurRenderer.blurredCrop(of: snapshot.image, geometry: snapshot.geometry, rect: rect).map { (id, $0) }
-            }
-        }.value
-        guard lastSnapshot?.cycleID == snapshot.cycleID else { return }
-        for (id, image) in rendered { blurCache[id] = image }
+    private func userScrolled() {
+        guard isActive, let target else { return }
+        let point = Geometry.appKitPointToQuartz(NSEvent.mouseLocation)
+        guard target.visibleRect.contains(point), !target.occluders.contains(where: { $0.rect.contains(point) })
+        else { return }
+        let now = Date()
+        lastScrollAt = now
+        dirtyReasons.insert(.scroll)
+        if dirtySince == nil { dirtySince = lastScrollAt }
+        scrollStarted(in: pane(at: point, target: target), now: now)
     }
 
-    private func render() {
-        guard isActive else {
-            overlay.clear()
-            return
-        }
-        let items: [OverlayItem] = regions.compactMap { region in
-            guard !staleRegionIDs.contains(region.id) else { return nil }
-            let decision = decisions[region.id]
-            let cover: OverlayItem.Cover
-            switch decision?.action ?? .leave {
-            case .leave: cover = .none
-            case .dim: cover = .dim
-            case .blur: cover = blurCache[region.id].map { .blur($0) } ?? .none
-            }
-            if !showBoxes, case .none = cover { return nil }
-            return OverlayItem(
-                rect: region.rect, number: region.number, cover: cover, showBox: showBoxes,
-                label: badgeLabel(region, decision), color: tierColor(decision),
-                uncertain: region.geometryUncertain)
-        }
-        overlay.update(displayID: selectedDisplayID, items: items)
-    }
-
-    private func badgeLabel(_ region: ScreenRegion, _ decision: RegionDecision?) -> String {
-        var label = "#\(region.number)"
-        if let score = decision?.pDistracting { label += String(format: " %.2f", score) } else { label += " ?" }
-        if decision?.overridden == true { label += " revealed" }
-        return label
-    }
-
-    private func tierColor(_ decision: RegionDecision?) -> NSColor {
-        guard let decision, decision.pDistracting != nil else { return .systemGray }
-        switch decision.tier {
-        case .leave: return .systemGreen
-        case .dim: return .systemOrange
-        case .blur: return .systemRed
-        }
-    }
-
-    private func summaryActivity() -> String {
-        let visible = regions.filter { !staleRegionIDs.contains($0.id) }
-        let actions = visible.compactMap { decisions[$0.id]?.action }
-        let dimmed = actions.filter { $0 == .dim }.count
-        let blurred = actions.filter { $0 == .blur }.count
-        let unscored = visible.filter { decisions[$0.id]?.pDistracting == nil }.count
-        var parts = ["Watching \(visible.count) region\(visible.count == 1 ? "" : "s")"]
-        if dimmed > 0 { parts.append("\(dimmed) dimmed") }
-        if blurred > 0 { parts.append("\(blurred) blurred") }
-        if unscored > 0 { parts.append("\(unscored) unscored") }
-        return parts.joined(separator: " · ")
-    }
-
-}
-
-// MARK: - Coverage and diagnostics
-
-extension SessionController {
-    private func describeSkipped(_ target: TargetWindow) -> [String] {
-        target.occluders.map { "Skipped: under \($0.owner) (layer \($0.layer)) — \($0.rect.shortDescription)" }
-            + target.ignoredOverlays.map {
-                "Ignored overlay from \($0.owner) (layer \($0.layer)), assumed transparent — \($0.rect.shortDescription)"
-            }
-    }
-
-    private func updateCoverage(
-        target: TargetWindow, ax: AXReadResult, stats: MergeStats, segmentation: SegmentationOutput, notes: [String]
-    ) {
-        var info = Coverage(
-            appName: target.appName, windowTitle: target.title, windowID: target.windowID,
-            displayName: displayName(target.displayID), bounds: target.visibleRect)
-        info.readMode = stats.axKept > 0 ? "Accessibility + OCR" : "OCR only"
-        info.axStatus = "\(ax.status) · \(ax.nodesVisited) nodes · \(ax.texts.count) texts "
-            + "(\(stats.axKept) confirmed visible) · \(ax.containers.count) containers"
-        info.skippedAreas = describeSkipped(target)
-        var allNotes = notes
-        allNotes.append("OCR lines: \(stats.ocrInput) (\(stats.ocrDuplicates) duplicated AX text, \(stats.ocrKept) kept)")
-        if stats.axUnconfirmed > 0 {
-            allNotes.append("\(stats.axUnconfirmed) AX texts had no visible OCR text under them — skipped as possibly hidden")
-        }
-        if segmentation.containerGroups == 0 {
-            allNotes.append("No AX containers used: boxes cover text blocks only, not card/image backgrounds")
-        } else {
-            allNotes.append("\(segmentation.containerGroups) regions use AX container bounds")
-        }
-        if segmentation.droppedTiny > 0 { allNotes.append("\(segmentation.droppedTiny) tiny text blocks ignored") }
-        if segmentation.droppedOverCap > 0 {
-            allNotes.append("\(segmentation.droppedOverCap) blocks over the \(Segmenter.maxRegions)-region cap ignored")
-        }
-        info.notes = allNotes
-        coverage = info
-    }
-
-    private func log(_ record: [String: Any]) {
+    func log(_ record: [String: Any]) {
         guard diagnosticsEnabled else { return }
         var record = record
         record["session"] = sessionID ?? NSNull()
         DiagnosticsLog.shared.append(record)
-    }
-
-    private func logCycle(context: CycleContext, timings: CycleTimings, axUsed: Bool, error: String?) {
-        guard diagnosticsEnabled else { return }
-        let regionRecords: [[String: Any]] = regions.map { region in
-            let decision = decisions[region.id]
-            return [
-                "n": region.number,
-                "src": region.sourceLabel,
-                "chars": region.text.count,
-                "p": decision?.pDistracting ?? NSNull(),
-                "action": decision?.action.rawValue ?? "leave",
-                "uncertain": region.geometryUncertain,
-                "stale": staleRegionIDs.contains(region.id),
-            ]
-        }
-        let timingRecord: [String: Any] = [
-            "queue": timings.queueMs ?? NSNull(), "capture": timings.captureMs, "ax": timings.axMs,
-            "ocr": timings.ocrMs, "group": timings.groupMs, "classify": timings.classifyMs ?? NSNull(),
-            "blur": timings.blurMs ?? NSNull(), "cycle": timings.totalMs,
-            "capture_to_overlay": timings.captureToOverlayMs, "change_to_overlay": timings.changeToOverlayMs ?? NSNull(),
-        ]
-        log([
-            "event": "cycle", "cycle": context.id, "task_rev": context.revision, "mode": mode.rawValue,
-            "read_mode": axUsed ? "ax+ocr" : "ocr", "regions": timings.regionCount,
-            "classified": timings.classifiedCount, "cached": timings.cachedCount, "ax_nodes": timings.axNodes,
-            "ax_texts": timings.axTexts, "ocr_lines": timings.ocrLines, "ms": timingRecord,
-            "decisions": regionRecords, "error": error ?? NSNull(),
-        ])
     }
 }

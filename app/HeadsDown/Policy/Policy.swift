@@ -1,37 +1,74 @@
 import Foundation
 
-/// Threshold policy from the benchmark plan. The score is a distraction probability from the
-/// model, not a guarantee; segmentation quality is judged separately (`geometryUncertain`).
-enum Policy {
-    static let blurAt = 0.8
-    static let dimAt = 0.5
+/// How much Heads Down hides. Cutoffs are uncalibrated starting points chosen from one session's
+/// score distribution (median 0.57; only 4% of regions scored below 0.20), not measured optimums.
+enum Strictness: String, CaseIterable, Identifiable {
+    case relaxed, balanced, strict
+    var id: String { rawValue }
 
-    static func tier(for score: Double?) -> CoverAction {
-        guard let score else { return .leave }
-        if score >= blurAt { return .blur }
-        if score >= dimAt { return .dim }
-        return .leave
+    var label: String {
+        switch self {
+        case .relaxed: return "Relaxed"
+        case .balanced: return "Balanced"
+        case .strict: return "Strict"
+        }
     }
 
-    /// What actually happens on screen, with a short policy note (not a model rationale).
-    static func applied(
-        score: Double?, mode: CoverMode, geometryUncertain: Bool, revealed: Bool
-    ) -> (action: CoverAction, note: String) {
-        let tier = tier(for: score)
-        guard let score else { return (.leave, "No valid score yet — left uncovered") }
-        if tier == .leave { return (.leave, String(format: "%.2f < 0.50 — left alone", score)) }
-        if revealed { return (.leave, "Revealed by you — left uncovered") }
-        if geometryUncertain { return (.leave, "Overlaps another window — left uncovered") }
-        switch mode {
-        case .observe:
-            return (.leave, "Observe mode — would \(tier.rawValue)")
-        case .dim:
-            return (.dim, String(format: "%.2f ≥ 0.50 — dimmed (dim mode)", score))
-        case .blur:
-            return tier == .blur
-                ? (.blur, String(format: "%.2f ≥ 0.80 — blurred", score))
-                : (.dim, String(format: "0.50 ≤ %.2f < 0.80 — dimmed", score))
+    /// Regions scoring at or above this are distracting.
+    var coverAt: Double {
+        switch self {
+        case .relaxed: return 0.65
+        case .balanced, .strict: return 0.5
         }
+    }
+
+    /// Strict covers the whole window except related regions; the others cover distracting regions only.
+    var coversWholeWindow: Bool { self == .strict }
+
+    var explanation: String {
+        switch self {
+        case .relaxed: return String(format: "Only regions scoring ≥ %.2f are hidden.", coverAt)
+        case .balanced: return String(format: "Regions scoring ≥ %.2f are hidden.", coverAt)
+        case .strict:
+            return String(format: "Everything is hidden except regions scoring < %.2f.", coverAt)
+        }
+    }
+}
+
+/// Turns a distraction score into a verdict for the chosen strictness. The model question is
+/// unchanged; only how its score is used changes. Controls and window chrome are never covered,
+/// regardless of verdict (see the renderer).
+enum Policy {
+    static func version(_ strictness: Strictness) -> String {
+        String(format: "%@-%.2f", strictness.rawValue, strictness.coverAt)
+    }
+
+    /// Returns the verdict, whether the region may stay visible, and a short policy note.
+    static func decide(
+        score: Double?, strictness: Strictness, revealed: Bool, revealExpiry: Date?
+    ) -> (Verdict, Bool, String) {
+        let cutoff = strictness.coverAt
+        let verdict: Verdict
+        let note: String
+        if let score {
+            if score < cutoff {
+                verdict = .keep
+                note = String(format: "%.2f < %.2f — left visible", score, cutoff)
+            } else {
+                verdict = .cover
+                note = String(format: "%.2f ≥ %.2f — hidden", score, cutoff)
+            }
+        } else {
+            verdict = .unknown
+            note = strictness.coversWholeWindow
+                ? "No valid score yet — hidden (Strict)" : "No valid score yet — left visible"
+        }
+        if revealed {
+            let until = revealExpiry.map { " until \($0.formatted(date: .omitted, time: .shortened))" } ?? ""
+            return (verdict, true, "Revealed by you\(until)")
+        }
+        let visible = strictness.coversWholeWindow ? verdict == .keep : verdict != .cover
+        return (verdict, visible, note)
     }
 }
 
@@ -51,17 +88,18 @@ final class RevealOverrides {
         expiries[key(revision, fingerprint)] = nil
     }
 
-    func isRevealed(revision: Int, fingerprint: String) -> Bool {
-        guard let expiry = expiries[key(revision, fingerprint)] else { return false }
-        if expiry < Date() {
-            expiries[key(revision, fingerprint)] = nil
-            return false
-        }
-        return true
+    func expiry(revision: Int, fingerprint: String) -> Date? {
+        guard let expiry = expiries[key(revision, fingerprint)], expiry > Date() else { return nil }
+        return expiry
     }
 
-    func expiry(revision: Int, fingerprint: String) -> Date? {
-        isRevealed(revision: revision, fingerprint: fingerprint) ? expiries[key(revision, fingerprint)] : nil
+    /// Drops expired reveals. Returns true if any expired, so policy can be re-applied even on a
+    /// completely static screen.
+    func expireDue() -> Bool {
+        let now = Date()
+        let before = expiries.count
+        expiries = expiries.filter { $0.value > now }
+        return expiries.count != before
     }
 
     func clear() {
@@ -69,11 +107,12 @@ final class RevealOverrides {
     }
 }
 
-/// Bounded score cache keyed by task revision, provider, question version, and classifier input.
+/// Bounded in-memory LRU score cache keyed by task revision, provider, question version, and the
+/// exact canonical classifier payload.
 struct ScoreCache {
     let limit: Int
-    private var values: [String: Double] = [:]
-    private var order: [String] = []
+    private var values: [String: (score: Double, used: UInt64)] = [:]
+    private var clock: UInt64 = 0
 
     init(limit: Int) {
         self.limit = limit
@@ -83,15 +122,24 @@ struct ScoreCache {
         "\(revision)|\(provider)|\(question)|\(input)"
     }
 
-    subscript(key: String) -> Double? { values[key] }
+    mutating func get(_ key: String) -> Double? {
+        guard let entry = values[key] else { return nil }
+        clock += 1
+        values[key] = (entry.score, clock)
+        return entry.score
+    }
+
+    func peek(_ key: String) -> Double? { values[key]?.score }
 
     mutating func set(_ key: String, _ value: Double) {
-        if values.updateValue(value, forKey: key) == nil { order.append(key) }
-        while order.count > limit { values[order.removeFirst()] = nil }
+        clock += 1
+        values[key] = (value, clock)
+        if values.count > limit, let oldest = values.min(by: { $0.value.used < $1.value.used })?.key {
+            values[oldest] = nil
+        }
     }
 
     mutating func removeAll() {
         values.removeAll()
-        order.removeAll()
     }
 }

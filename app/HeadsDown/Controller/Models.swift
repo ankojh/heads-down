@@ -16,9 +16,12 @@ enum CoverMode: String, CaseIterable, Identifiable {
     }
     var explanation: String {
         switch self {
-        case .observe: return "Nothing is hidden. Boxes and scores only."
-        case .dim: return "Regions scoring ≥ 0.50 are darkened (not blurred)."
-        case .blur: return "≥ 0.80 blurred from a snapshot, 0.50–0.80 dimmed."
+        case .observe:
+            return "Debug only: nothing is hidden. Boxes and scores, no focus protection."
+        case .dim:
+            return "Darkens what the hiding level marks as distracting."
+        case .blur:
+            return "Blurs what the hiding level marks as distracting."
         }
     }
 }
@@ -38,8 +41,23 @@ enum RunState: Equatable {
     }
 }
 
-enum CoverAction: String {
-    case leave, dim, blur
+/// Semantic verdict for one region under the strict policy. Rendering depends on the mode.
+enum Verdict: String {
+    /// Valid low distraction score: allowed to stay visible.
+    case keep
+    /// Valid score at or above the keep cutoff.
+    case cover
+    /// No valid score (pending, failed, or malformed). Covered in strict mode.
+    case unknown
+}
+
+/// Why the controller decided screen analysis is needed.
+enum DirtyReason: String {
+    case newTarget = "new_target"
+    case layout
+    case localChange = "local_change"
+    case motion
+    case scroll
 }
 
 enum TextSource: String {
@@ -96,6 +114,24 @@ struct TargetWindow {
     }
 }
 
+/// A window that was analyzed while frontmost and is still visible behind other windows. Its
+/// cover keeps being drawn from what was read then (policy re-applied to current scores) until
+/// the window moves, disappears, or becomes frontmost and is re-read.
+struct RetainedWindow {
+    let windowID: CGWindowID
+    let bounds: CGRect
+    let visibleRect: CGRect
+    let regions: [ScreenRegion]
+    let chrome: ContentEnvelope.Chrome?
+    let controls: [CGRect]
+    /// Last blurred cover image (not refreshed while the window is in the background).
+    let coverImage: CGImage?
+    var occluders: [CGRect] = []
+    /// Position in the window stack (0 = frontmost); used to draw back to front.
+    var stackIndex = 0
+    let retainedAt: Date
+}
+
 struct ScreenSnapshot {
     let cycleID: UInt64
     let capturedAt: Date
@@ -105,21 +141,26 @@ struct ScreenSnapshot {
 
 struct ScreenRegion: Identifiable {
     /// Transient tracking ID: content fingerprint plus an occurrence index.
-    let id: String
+    var id: String
     var number: Int
     var rect: CGRect
+    /// Canonical text exactly as submitted to the classifier (already truncated).
     var text: String
     var appName: String
+    /// Canonical window title exactly as submitted to the classifier.
     var windowTitle: String
     var sources: Set<TextSource>
     var observationCount: Int
     var reason: String
     /// Hash of normalized region text. Used for tracking and reveal overrides.
     var fingerprint: String
-    /// Hash of everything the classifier sees (app, title, text). Used for score caching.
+    /// Hash of the exact canonical classifier payload. Used for score caching.
     var classifierFingerprint: String
     var geometryUncertain: Bool
     var windowID: CGWindowID
+    /// A fragment cut by a pane edge that kept the identity (text, fingerprints) of the whole
+    /// region it was scrolled from. See `SessionController.inheritEdgeIdentity`.
+    var identityKept = false
 
     var sourceLabel: String {
         sources.map(\.rawValue).sorted().joined(separator: "+")
@@ -130,13 +171,14 @@ struct RegionDecision {
     let regionID: String
     let fingerprint: String
     let taskRevision: Int
-    let cycleID: UInt64
     let providerID: String
     let questionVersion: String
+    let policyVersion: String
     /// Validated P(distracting), or nil when no valid score exists.
     let pDistracting: Double?
-    let tier: CoverAction
-    let action: CoverAction
+    let verdict: Verdict
+    /// True when policy allows the region to stay visible (keep verdict or a user reveal).
+    let visibleIntent: Bool
     let overridden: Bool
     let policyNote: String
     let decidedAt: Date
@@ -150,6 +192,7 @@ struct Coverage {
     var bounds: CGRect?
     var readMode: String = "—"
     var axStatus: String = "—"
+    var chromeNote: String = "—"
     var skippedAreas: [String] = []
     var notes: [String] = []
     var skipReason: String?
@@ -157,32 +200,32 @@ struct Coverage {
 
 struct CycleTimings {
     var cycleID: UInt64 = 0
+    var trigger = ""
     var queueMs: Double?
     var captureMs: Double = 0
     var axMs: Double = 0
     var ocrMs: Double = 0
     var groupMs: Double = 0
-    var classifyMs: Double?
-    var blurMs: Double?
     var totalMs: Double = 0
-    var captureToOverlayMs: Double = 0
     var changeToOverlayMs: Double?
+    var ocrScope = "full"
+    var ocrBandFraction: Double = 1
+    var ocrFresh = 0
+    var ocrReused = 0
     var regionCount = 0
-    var classifiedCount = 0
-    var cachedCount = 0
+    var cacheHits = 0
+    var missesChanged = 0
+    var missesNew = 0
     var axNodes = 0
     var axTexts = 0
-    var ocrLines = 0
 
     var summary: String {
         var parts = [
             "capture \(Int(captureMs))",
             "AX \(Int(axMs))",
-            "OCR \(Int(ocrMs))",
+            "OCR \(Int(ocrMs)) (\(ocrScope))",
             "group \(Int(groupMs))",
         ]
-        if let classifyMs { parts.append("classify \(Int(classifyMs))") }
-        if let blurMs { parts.append("blur \(Int(blurMs))") }
         parts.append("cycle \(Int(totalMs)) ms")
         var text = parts.joined(separator: " · ")
         if let changeToOverlayMs { text += " · change→overlay \(Int(changeToOverlayMs)) ms" }

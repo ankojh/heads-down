@@ -1,5 +1,10 @@
 # Heads Down — implementation handoff
 
+> **Historical plan:** The native app now exists. Read `FIXES_HANDOFF.md` for the current
+> source/log investigation and requested fixes: stable change detection/caching and blur,
+> timed pause, and aggressive hiding. Its strict-policy requirements supersede the
+> conservative hiding defaults below.
+
 **Recipient:** Opus 5-5 (Cloudbridge)  
 **Repository:** `/Users/ankojh/b12/heads-down`  
 **Purpose:** Implement the first usable local macOS prototype, following the decisions below.  

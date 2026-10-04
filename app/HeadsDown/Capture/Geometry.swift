@@ -67,6 +67,16 @@ struct CaptureGeometry {
             height: norm.height * cropRect.height)
     }
 
+    /// Geometry for a sub-crop of this image (pixel rect, top-left origin). Used for banded OCR.
+    func subGeometry(pixelRect pixels: CGRect) -> CaptureGeometry {
+        let quartz = CGRect(
+            x: cropRect.minX + pixels.minX / scaleX, y: cropRect.minY + pixels.minY / scaleY,
+            width: pixels.width / scaleX, height: pixels.height / scaleY)
+        return CaptureGeometry(
+            displayID: displayID, displayBounds: displayBounds, cropRect: quartz,
+            pixelWidth: Int(pixels.width), pixelHeight: Int(pixels.height))
+    }
+
     /// Quartz global points → pixel rect in the captured image (top-left origin), clipped.
     func pixelRect(fromQuartz rect: CGRect) -> CGRect {
         let local = rect.intersection(cropRect).offsetBy(dx: -cropRect.minX, dy: -cropRect.minY)

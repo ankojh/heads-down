@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Debug inspector: what is covered, what was skipped, per-region text/source/bounds/grouping,
-/// scores and policy, timings. Everything shown is in memory only.
+/// score, policy verdict versus what was actually rendered, and timings. In memory only.
 struct InspectorView: View {
     @ObservedObject var controller: SessionController
 
@@ -23,8 +23,9 @@ struct InspectorView: View {
     private var regionList: some View {
         List(selection: $controller.selectedRegionID) {
             ForEach(controller.regions) { region in
-                RegionRow(region: region, decision: controller.decisions[region.id],
-                          stale: controller.staleRegionIDs.contains(region.id))
+                RegionRow(
+                    region: region, decision: controller.decisions[region.id],
+                    rendered: renderedStatus(controller, region))
                     .tag(region.id)
             }
         }
@@ -35,6 +36,16 @@ struct InspectorView: View {
             }
         }
     }
+}
+
+/// What is actually on screen for a region, as opposed to the policy's intent.
+@MainActor
+private func renderedStatus(_ controller: SessionController, _ region: ScreenRegion) -> String {
+    if !controller.isActive { return "not shown" }
+    if controller.mode == .observe { return "not covered (Observe)" }
+    if controller.visibleRegionIDs.contains(region.id) { return "visible" }
+    if controller.changedRegionIDs.contains(region.id) { return "covered: changed since read" }
+    return "covered"
 }
 
 private struct CoveragePanel: View {
@@ -58,16 +69,26 @@ private struct CoveragePanel: View {
                         Text("Analyzed area: \(bounds.shortDescription) · \(coverage.readMode)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    Text("Cover: \(controller.renderedCover) · policy \(Policy.version(controller.strictness)) · "
+                         + "\(controller.controlCount) controls kept visible · chrome: \(coverage.chromeNote)")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("AX: \(coverage.axStatus)").font(.caption).foregroundStyle(.secondary)
+                    Text("Scroll: \(controller.scrollStatus)").font(.caption).foregroundStyle(.secondary)
+                    Text("Cover image: \(controller.coverStatus)").font(.caption).foregroundStyle(.secondary)
                     ForEach(coverage.skippedAreas, id: \.self) { Text($0).font(.caption).foregroundStyle(.orange) }
                     ForEach(coverage.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
                 }
             }
             if let timings = controller.lastTimings {
-                Text("Last cycle #\(timings.cycleID): \(timings.summary) · \(timings.regionCount) regions, "
-                     + "\(timings.classifiedCount) classified, \(timings.cachedCount) cached")
+                Text("Last cycle #\(timings.cycleID) [\(timings.trigger)]: \(timings.summary)")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text("\(timings.regionCount) regions · \(timings.cacheHits) cached · "
+                     + "OCR \(timings.ocrFresh) new / \(timings.ocrReused) reused lines")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
+            CalendarInspector(controller: controller, calendar: CalendarAutomation.shared)
+            UsagePanel(usage: controller.usage, classifierName: controller.classifierName,
+                       rate: controller.classifier.usdPerMillionInputTokens)
             HStack {
                 Toggle("Write local timing log (no screen text)", isOn: $controller.diagnosticsEnabled)
                     .font(.caption)
@@ -78,10 +99,32 @@ private struct CoveragePanel: View {
     }
 }
 
+/// Per-session classifier usage. Tokens are what the provider reported; cost is an estimate from
+/// the published rate, not an invoice.
+private struct UsagePanel: View {
+    let usage: ClassificationStats
+    let classifierName: String
+    let rate: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(classifierName)\(usage.lastModel.map { " → \($0)" } ?? ""): \(usage.httpRequests) requests · "
+                 + "\(usage.inputTokens.formatted()) reported input tokens"
+                 + (rate > 0 ? String(format: " · ~$%.4f est.", Double(usage.inputTokens) / 1_000_000 * rate) : " · local, free")
+                 + " · \(usage.retries) retries · \(usage.failures) failed")
+            Text("Decisions: \(usage.decisions) new · \(usage.cacheHits) cache hits · \(usage.inFlightShares) in-flight shares · "
+                 + "\(usage.obsoleteDropped) obsolete skipped · \(usage.pending) pending · \(usage.inFlight) in flight · "
+                 + "\(usage.rounds) dispatch rounds")
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+    }
+}
+
 private struct RegionRow: View {
     let region: ScreenRegion
     let decision: RegionDecision?
-    let stale: Bool
+    let rendered: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -90,9 +133,8 @@ private struct RegionRow: View {
                 Text(region.sourceLabel).font(.caption2).padding(.horizontal, 4)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
                 Spacer()
-                if stale { Text("changed").font(.caption2).foregroundStyle(.orange) }
                 Text(scoreText).font(.caption.monospacedDigit())
-                Text(decision?.action.rawValue ?? "leave").font(.caption2).foregroundStyle(.secondary)
+                Text(rendered).font(.caption2).foregroundStyle(rendered == "visible" ? .green : .secondary)
             }
             Text(region.text.replacingOccurrences(of: "\n", with: " "))
                 .font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -127,19 +169,18 @@ private struct RegionDetail: View {
                     row("Source", "\(region.sourceLabel) · \(region.observationCount) text items")
                     row("Grouping", region.reason)
                     row("Bounds", "\(region.rect.shortDescription) (Quartz global points)")
-                    row("Geometry", region.geometryUncertain ? "Uncertain — overlaps a higher window" : "OK")
+                    row("Geometry", region.geometryUncertain ? "Partly under a higher window (that part stays visible)" : "OK")
                     row("Context sent", "app: \(region.appName) · title: \(region.windowTitle)")
                     row("Score", decision?.pDistracting.map { String(format: "P(distracting) = %.3f", $0) }
                         ?? "No valid score (unknown)")
-                    row("Score tier", decision?.tier.rawValue ?? "leave")
-                    row("Applied", "\(decision?.action.rawValue ?? "leave") — \(decision?.policyNote ?? "")")
-                    row("Provider", "\(decision?.providerID ?? "—") · \(decision?.questionVersion ?? "—")")
+                    row("Verdict", "\(decision?.verdict.rawValue ?? "unknown") — \(decision?.policyNote ?? "")")
+                    row("On screen", renderedStatus(controller, region))
+                    row("Provider", "\(decision?.providerID ?? "—") · \(decision?.questionVersion ?? "—") · "
+                        + (decision?.policyVersion ?? Policy.version(controller.strictness)))
                     row("Tracking ID", region.id)
-                    if controller.staleRegionIDs.contains(region.id) {
-                        row("Status", "Content changed since capture — hidden until re-read")
-                    }
                 }
-                Text("Scores are a model's distraction probability, not a guarantee or an explanation.")
+                Text("Scores are a model's distraction probability, not a guarantee or an explanation. "
+                     + "\(controller.strictness.label): \(controller.strictness.explanation) Controls always stay visible.")
                     .font(.caption2).foregroundStyle(.secondary)
                 HStack {
                     if decision?.overridden == true {
@@ -153,7 +194,7 @@ private struct RegionDetail: View {
                     }
                 }
                 Divider()
-                Text("Extracted text").font(.headline)
+                Text("Text sent to the classifier").font(.headline)
                 Text(region.text)
                     .font(.body.monospaced())
                     .textSelection(.enabled)
@@ -167,6 +208,31 @@ private struct RegionDetail: View {
         GridRow {
             Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             Text(value).font(.caption).textSelection(.enabled)
+        }
+    }
+}
+
+/// Calendar provenance and freshness. Event text appears only here and in the panel, never in logs.
+private struct CalendarInspector: View {
+    @ObservedObject var controller: SessionController
+    @ObservedObject var calendar: CalendarAutomation
+
+    var body: some View {
+        if calendar.connected {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Calendar: \(calendar.status.label) · task source "
+                     + (controller.taskSource == .manual ? "you" : "Google Calendar (event-owned)"))
+                if let brief = calendar.brief {
+                    Text("Brief [\(brief.compressorID), \(brief.activity.rawValue), \(brief.fingerprint.prefix(8))]: "
+                         + (brief.insufficientReason.map { "not used — \($0)" } ?? brief.text))
+                        .lineLimit(3)
+                }
+                Text("Last check: " + (calendar.lastPollAt.map { $0.formatted(date: .omitted, time: .standard) } ?? "never")
+                     + " · \(Int(calendar.lastPollMs)) ms · \(calendar.stats.polls) checks, \(calendar.stats.failures) failed · "
+                     + "briefs \(calendar.stats.briefsPrepared) prepared, \(calendar.stats.briefCacheHits) reused · "
+                     + "no model calls for calendar data")
+            }
+            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
 }
