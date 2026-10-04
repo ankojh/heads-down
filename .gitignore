@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+app/build/
+xcuserdata/
+compile_commands.json
+.pi-lens/
+.ruff_cache/
