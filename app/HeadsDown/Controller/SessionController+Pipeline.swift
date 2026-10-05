@@ -878,7 +878,7 @@ extension SessionController {
                 continue
             }
             let occluders = stack[..<index]
-                .filter { $0.layer < WindowLocator.ignoredOverlayLayer }
+                .filter { !$0.transparent }
                 .map { $0.bounds.intersection(window.visibleRect) }
                 .filter { !$0.isNull && $0.area > 0 }
             if occluders != window.occluders || index != window.stackIndex {

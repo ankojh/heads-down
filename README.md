@@ -353,7 +353,8 @@ Hiding is a focus aid, not a security boundary.
 - Cache keys follow the exact text sent. If OCR rewraps or regroups the same prose differently, it
   counts as new input and is scored again. Title changes (other than leading counters) also count,
   because Jev sees the title.
-- Windows at layer ≥ 1000 (e.g. a dictation utility's overlay) are assumed transparent; the Inspector
+- Windows at layer ≥ 1000 (e.g. a dictation utility's overlay) and non-app windows spanning nearly the
+  whole display (e.g. Notification Center's full-screen host) are assumed transparent; the Inspector
   lists them. Areas under any other higher window stay uncovered.
 - English text only. Images, video, and canvas content aren't understood.
 - Chrome and Electron apps (Slack, VS Code, Discord) expose little to accessibility, so they run

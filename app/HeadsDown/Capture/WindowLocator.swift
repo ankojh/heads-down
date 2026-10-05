@@ -32,6 +32,17 @@ enum WindowLocator {
     /// transparent click-through overlays from utilities. They are reported, not treated as occluders.
     static let ignoredOverlayLayer = 1000
 
+    /// Windows above the target that are reported, not treated as occluders: high-layer utility
+    /// overlays, and any non-app (layer ≠ 0) window spanning nearly the whole display. The latter are
+    /// transparent system hosts (Notification Center keeps one over the full screen for banners and
+    /// widgets); an opaque one would hide every app, so treating it as an occluder would only ever
+    /// skip every window.
+    static func isTransparentOverlay(layer: Int, bounds: CGRect, display: CGRect) -> Bool {
+        if layer >= ignoredOverlayLayer { return true }
+        guard layer != 0 else { return false }
+        return bounds.intersection(display).area >= 0.95 * display.area
+    }
+
     static func locate(
         displayID: CGDirectDisplayID, ignoring ignoredWindowIDs: Set<CGWindowID>
     ) -> Result<TargetWindow, TargetSkip> {
@@ -78,7 +89,11 @@ enum WindowLocator {
                 let clipped = item.rect.intersection(visible)
                 guard !clipped.isNull, clipped.area > 0 else { continue }
                 let entry = Occluder(rect: clipped, owner: item.owner, layer: item.layer)
-                if item.layer >= ignoredOverlayLayer { ignored.append(entry) } else { occluders.append(entry) }
+                if isTransparentOverlay(layer: item.layer, bounds: item.rect, display: display) {
+                    ignored.append(entry)
+                } else {
+                    occluders.append(entry)
+                }
             }
             let occludedArea = occluders.reduce(CGFloat(0)) { $0 + $1.rect.area }
             if occludedArea >= 0.9 * visible.area { return .failure(.mostlyOccluded(owner)) }
@@ -97,6 +112,8 @@ enum WindowLocator {
         let id: CGWindowID
         let bounds: CGRect
         let layer: Int
+        /// Reported, never clips covers (see `isTransparentOverlay`).
+        let transparent: Bool
     }
 
     /// On-screen windows overlapping the display, front to back (Heads Down's overlay excluded).
@@ -113,7 +130,9 @@ enum WindowLocator {
                   bounds.intersects(display),
                   (info[kCGWindowAlpha as String] as? Double ?? 1) >= 0.01
             else { return nil }
-            return StackWindow(id: number, bounds: bounds, layer: (info[kCGWindowLayer as String] as? Int) ?? 0)
+            let layer = (info[kCGWindowLayer as String] as? Int) ?? 0
+            return StackWindow(id: number, bounds: bounds, layer: layer,
+                               transparent: isTransparentOverlay(layer: layer, bounds: bounds, display: display))
         }
     }
 }
