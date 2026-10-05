@@ -54,6 +54,12 @@ final class EventKitCalendarSource {
         store.calendars(for: .event).filter { $0.type != .subscription }
     }
 
+    /// Asks macOS to sync remote calendars on the next check (e.g. "Check now"). Google accounts
+    /// don't push, so this is the only way to pull a just-created event sooner.
+    func requestSourceRefresh() {
+        lastSourceRefresh = .distantPast
+    }
+
     func currentEvents(now: Date) throws -> CalendarFetch {
         guard Self.hasAccess else { throw CalendarFetchError.notAuthorized }
         let started = Date()
@@ -71,6 +77,47 @@ final class EventKitCalendarSource {
             calendars: calendars)
         let events = store.events(matching: predicate).map(Self.map)
         return CalendarFetch(events: events, complete: true, fetchedAt: now, ms: elapsedMs(since: started))
+    }
+
+    /// What the store can see, for the log when no event is found. Counts, account kinds, and minute
+    /// offsets only; never titles, calendar names, or account names.
+    func storeSummary(now: Date) -> [String: Any] {
+        guard Self.hasAccess else { return ["access": false] }
+        let all = store.calendars(for: .event)
+        let kinds: [EKSourceType: String] = [
+            .local: "local", .exchange: "exchange", .calDAV: "caldav", .mobileMe: "icloud",
+            .subscribed: "subscribed", .birthdays: "birthdays",
+        ]
+        let sources = Dictionary(grouping: all, by: { kinds[$0.source.sourceType] ?? "other" }).mapValues(\.count)
+        let used = calendars
+        let dayEvents = used.isEmpty ? [] : store.events(matching: store.predicateForEvents(
+            withStart: now.addingTimeInterval(-12 * 3600), end: now.addingTimeInterval(12 * 3600), calendars: used))
+        let timed = dayEvents.filter { !$0.isAllDay }
+        let nearest = timed.min { abs($0.startDate.timeIntervalSince(now)) < abs($1.startDate.timeIntervalSince(now)) }
+        var summary: [String: Any] = [
+            "calendars": all.count, "calendars_used": used.count, "sources": sources,
+            "events_24h": dayEvents.count, "all_day_24h": dayEvents.count - timed.count,
+        ]
+        // Events in calendars Heads Down leaves out (subscriptions), to spot a misfiled calendar.
+        let excluded = all.filter { candidate in !used.contains { $0.calendarIdentifier == candidate.calendarIdentifier } }
+        if !excluded.isEmpty {
+            let skipped = store.events(matching: store.predicateForEvents(
+                withStart: now.addingTimeInterval(-12 * 3600), end: now.addingTimeInterval(12 * 3600), calendars: excluded))
+            summary["excluded_events_24h"] = skipped.count
+            summary["excluded_active_now"] = skipped.filter { !$0.isAllDay && $0.startDate <= now && now < $0.endDate }.count
+        }
+        // Whether the store holds anything recent at all (sync working) vs. only today missing.
+        let week = used.isEmpty ? [] : store.events(matching: store.predicateForEvents(
+            withStart: now.addingTimeInterval(-7 * 86400), end: now.addingTimeInterval(7 * 86400), calendars: used))
+        summary["events_14d"] = week.count
+        if let latest = week.filter({ $0.startDate <= now }).max(by: { $0.startDate < $1.startDate }) {
+            summary["latest_past_start_h"] = Int(now.timeIntervalSince(latest.startDate) / 3600)
+        }
+        if let nearest {
+            summary["nearest_start_min"] = Int(nearest.startDate.timeIntervalSince(now) / 60)
+            summary["nearest_end_min"] = Int(nearest.endDate.timeIntervalSince(now) / 60)
+        }
+        return summary
     }
 
     // MARK: - Mapping

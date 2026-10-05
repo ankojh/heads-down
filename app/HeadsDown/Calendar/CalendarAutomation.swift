@@ -72,6 +72,9 @@ final class CalendarAutomation: ObservableObject {
     private var timerTask: Task<Void, Never>?
     private var polling = false
     private var lastSuccessAt: Date?
+    /// Log what the store can see (counts only) when nothing is found: on "Check now", else every 10 min.
+    private var storeSummaryDue = true
+    private var lastStoreSummaryAt = Date.distantPast
     private var lastEligible: [CalendarEvent] = []
     private var upcomingStarts: [Date] = []
     private var briefCache: [String: FocusBrief] = [:]
@@ -249,6 +252,8 @@ final class CalendarAutomation: ObservableObject {
 
     /// One fetch to show the current event, also when auto-start is off.
     func checkNow() {
+        storeSummaryDue = true
+        source.requestSourceRefresh()
         refreshSoon()
     }
 
@@ -352,6 +357,11 @@ final class CalendarAutomation: ObservableObject {
             "event": "calendar_poll", "ms": Int(fetch.ms), "events": fetch.events.count,
             "eligible": lastEligible.count, "complete": fetch.complete, "status": statusCategory,
         ])
+        if fetch.events.isEmpty, storeSummaryDue || Date().timeIntervalSince(lastStoreSummaryAt) > 600 {
+            storeSummaryDue = false
+            lastStoreSummaryAt = Date()
+            session.log(["event": "calendar_store"].merging(source.storeSummary(now: Date())) { $1 })
+        }
         // With auto-start off a check is one-off (e.g. "Check now"); nothing keeps polling.
         if autoStartEnabled { scheduleNext() }
     }
