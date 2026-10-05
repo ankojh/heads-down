@@ -264,23 +264,46 @@ extension SessionController {
 
     // MARK: - Commit integration
 
+    /// Carry coverage into a replacement read, not the previous text's score. Local hover changes
+    /// and regrouped OCR can change a fingerprint even when the distracting card is still there.
+    /// Scroll positions are mapped to the capture time, not the later time this read commits.
+    func pendingCovers(for fresh: [ScreenRegion], capturedAt: Date) -> Set<String> {
+        guard let target else { return [] }
+        var areas: [CGRect] = []
+        for old in regions where decisions[old.id]?.visibleIntent == false {
+            guard let tracker = trackers.first(where: { $0.owns(old.rect) }) else {
+                areas.append(layoutChanged ? contentArea(target) : old.rect)
+                continue
+            }
+            guard tracker.state == .tracking, let offset = tracker.offset(at: capturedAt) else {
+                areas.append(tracker.pane.viewport)
+                continue
+            }
+            let rect = tracker.isFixed(old.rect) ? old.rect
+                : old.rect.offsetBy(dx: offset.dx, dy: offset.dy)
+            let covered = rect.insetBy(dx: -tracker.margin, dy: -tracker.margin)
+                .intersection(tracker.pane.viewport)
+            if !covered.isNull { areas.append(covered) }
+        }
+        for tracker in trackers where paneHasCover(tracker) {
+            guard tracker.state == .tracking, let offset = tracker.offset(at: capturedAt) else {
+                areas.append(tracker.pane.viewport)
+                continue
+            }
+            areas += tracker.pane.viewport.subtracting(
+                tracker.pane.viewport.offsetBy(dx: offset.dx, dy: offset.dy))
+            areas += tracker.unreliableRects
+        }
+        return Set(fresh.filter { region in
+            areas.contains { $0.intersects(region.rect.insetBy(dx: 2, dy: 2)) }
+        }.map(\.id))
+    }
+
     /// Called when a read commits. Panes still moving after its capture keep tracking relative to the
-    /// new read; the rest are done. Covers for unscored content exposed by scrolling are held briefly.
+    /// new read; the rest are done. Pending coverage was transferred before this rebase.
     func reconcileTrackers(reference: TrackFrame?, captureStartedAt: Date) {
         trackingReference = reference
         guard !trackers.isEmpty || layoutChanged else { return }
-        if !strictness.coversWholeWindow, let target {
-            var held: [CGRect] = []
-            for tracker in trackers where paneHasCover(tracker) {
-                held += tracker.isLost ? [tracker.pane.viewport] : tracker.exposedRects + tracker.unreliableRects
-            }
-            if layoutChanged, regions.contains(where: { region in
-                decisions[region.id]?.visibleIntent == false && !trackers.contains { $0.owns(region.rect) }
-            }) {
-                held.append(contentArea(target))
-            }
-            if !held.isEmpty { exposureHold = (held, Date().addingTimeInterval(Self.exposureHoldTime)) }
-        }
         let continuing = trackers.filter { $0.lastActivityAt >= captureStartedAt }
         if continuing.count < trackers.count { logTracking(outcome: "reconciled") }
         trackers = continuing.map { tracker in
@@ -372,14 +395,6 @@ extension SessionController {
         case .fresh(let current), .moved(let current, _, _): return current
         case .unknown, .gone: return nil
         }
-    }
-
-    /// True when a new region's unscored content was exposed by scrolling moments ago.
-    func heldAfterScroll(_ region: ScreenRegion, decision: RegionDecision?) -> Bool {
-        guard let hold = exposureHold, Date() < hold.until, decision?.pDistracting == nil,
-              decision?.overridden != true
-        else { return false }
-        return hold.areas.contains { $0.intersects(region.rect.insetBy(dx: 2, dy: 2)) }
     }
 
     /// Image shifts for scrolled panes, so the blurred cover moves with its content. Uses the pane's

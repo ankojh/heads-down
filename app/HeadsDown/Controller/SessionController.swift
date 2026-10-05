@@ -45,9 +45,6 @@ final class SessionController: ObservableObject {
     static let trackInterval: TimeInterval = 1.0 / 15
     /// Keep measuring this long after the last wheel event (momentum and smooth-scroll animations).
     static let trackQuiet: TimeInterval = 0.5
-    /// After a mid-scroll re-read, newly exposed content that had no score yet stays under the
-    /// transition mask this long (Balanced/Relaxed, panes that had covered content only).
-    static let exposureHoldTime: TimeInterval = 4
     static let timedPauseChoices = [3, 2]
     static let maxRetainedWindows = 6
 
@@ -223,8 +220,9 @@ final class SessionController: ObservableObject {
     var trackTask: Task<Void, Never>?
     var trackLoopToken: UInt64 = 0
     var trackStats = TrackStats()
-    /// Areas whose new, unscored content stays masked briefly after a mid-scroll re-read.
-    var exposureHold: (areas: [CGRect], until: Date)?
+    /// Current regions that replaced covered content. Keep them covered until a score or reveal,
+    /// including across repeated reads; never inherit the old content's semantic score.
+    var pendingCoverIDs: Set<String> = []
     var lastCycleStart = Date.distantPast
     var retainedOCR: [TextObservation] = []
     var lastFullOCRAt = Date.distantPast
@@ -579,6 +577,7 @@ extension SessionController {
     /// A new task invalidates every decision, but not the screen reading: regions stay, their
     /// scores become pending (covered), and only classification reruns.
     func changeTask(to task: String) {
+        pendingCoverIDs = []
         currentTask = task
         taskRevision += 1
         scoreCache.removeAll()
@@ -678,7 +677,7 @@ extension SessionController {
         stopTracking()
         scrollPanes = []
         trackingReference = nil
-        exposureHold = nil
+        pendingCoverIDs = []
         retainedOCR = []
         lastFullOCRAt = .distantPast
         controlRects = []

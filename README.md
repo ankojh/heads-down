@@ -109,7 +109,7 @@ hardened runtime; it needs no entitlements for this local prototype.
    | Hiding level | What is hidden |
    |---|---|
    | **Relaxed** | Text regions (and their card area) scoring ≥ 0.65 |
-   | **Balanced** (default) | Text regions scoring ≥ 0.50; unscored content, images, and empty space stay visible |
+   | **Balanced** (default) | Text regions scoring ≥ 0.50; other content stays visible, except pending replacements of previously covered areas |
    | **Strict** | The whole window, except regions scoring < 0.50 |
 
    Windows you switch away from **keep their blur** while they stay visible and in place. Their
@@ -220,8 +220,9 @@ Once started, the loop runs by itself:
     it can't cover yet is filled with the page's average color rather than a dark placeholder.
   - Every measurement is checked against the previous tracking frame and, if that fails, against
     the frame the regions were read from (captured the same way and at the same scale as the live
-    frames), so one bad frame doesn't lose the pane. Until the first measurement arrives (up to
-    0.5 s) covers stay put, grown by the margin.
+    frames), so one bad frame doesn't lose the pane. Until the first measurement arrives, a pane
+    that had covered content is masked immediately: content may already be moving, so leaving
+    covers at their old positions would briefly reveal it.
   - When movement still can't be verified (too large a jump, navigation, inconsistent cells, nested
     panes scrolled together, failed capture), the pane counts as unknown until a later frame matches
     the read frame again or the window is re-read. In Relaxed/Balanced a pane that
@@ -230,10 +231,16 @@ Once started, the loop runs by itself:
     the affected keep holes.
   - After scrolling settles the usual re-read runs. Its commit swaps tracked geometry for the new
     regions in one step, and cached scores apply right away. A read that lands mid-scroll restarts
-    tracking from its own frame. Unscored content exposed by a scroll in a pane that had covers stays
-    masked for up to 4 s while it's scored. A region cut by the pane edge keeps the text and
-    identity of the whole region it scrolled from, so a shrinking fragment doesn't become a new
-    paid input.
+    tracking from its own frame. Regions replacing covered areas (including newly exposed scroll
+    strips) stay covered until their own scores arrive or you explicitly reveal them. This also
+    applies when hover changes or OCR regrouping produce new text in an existing covered card.
+    Repeated reads and slow/failed classification do not expire that coverage; no old score is
+    assigned to new text. Unscored content elsewhere still follows the selected hiding level.
+    A region cut by the pane edge keeps the text and identity of the whole region it scrolled from,
+    so a shrinking fragment doesn't become a new paid input.
+  - Hover tooltips and popups update the holes in the overlay without resetting the underlying
+    window's covers. Their appearance/disappearance requests a fresh read; reads captured under
+    the old occlusion are rejected. Actual window moves/resizes still invalidate old geometry.
 - **Deciding when to re-read:** changes must persist ~0.6 s after content settles (2 s at most for
   content that keeps changing). Changes already captured by a finished read are consumed; changes
   that disappear on their own trigger nothing. Animation (cells changing for 3+ ticks) away from
@@ -354,6 +361,15 @@ Hiding is a focus aid, not a security boundary.
 - A Vision request already running can't be interrupted. Pause and stop take effect immediately on
   screen; the abandoned work finishes in the background before the next read starts.
 - This is rule-based orchestration of local tools, not an LLM deciding which tools to call.
+
+Run the synthetic cover-continuity regression checks (no screen capture or classifier requests):
+
+```bash
+app/scripts/test-cover-continuity.sh
+```
+
+These exercise hover/OCR replacement, repeated pending reads, score and reveal release, scroll
+startup and capture-time placement, lost tracking, and popup versus window geometry changes.
 
 Checked during builds:
 

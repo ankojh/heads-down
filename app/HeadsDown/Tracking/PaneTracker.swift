@@ -34,8 +34,6 @@ struct PaneTracker {
         case conflicted
     }
 
-    /// Before the first measurement, covers stay where they were (grown by the margin) this long.
-    static let startGrace: TimeInterval = 0.5
     /// Tracking without a committed re-read is not trusted longer than this.
     static let maxAnchorAge: TimeInterval = 30
     static let baseMargin: CGFloat = 4
@@ -91,11 +89,10 @@ struct PaneTracker {
         return false
     }
 
-    /// What rendering should assume: a tracker that hasn't measured anything in time counts as lost.
+    /// Before the first measurement, content may already have moved beyond its old cover.
+    /// Use the pane fallback immediately rather than exposing it during a startup grace period.
     func effectiveState(now: Date) -> State {
-        if state == .starting, now.timeIntervalSince(startedAt) > Self.startGrace {
-            return .lost("no measurement yet")
-        }
+        if state == .starting { return .lost("awaiting first movement measurement") }
         return state
     }
 

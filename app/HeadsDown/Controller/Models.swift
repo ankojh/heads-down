@@ -108,9 +108,15 @@ struct TargetWindow {
     /// Overlapping windows at layer >= 1000 that were assumed transparent and not treated as occluders.
     let ignoredOverlays: [Occluder]
 
+    /// Popups and tooltips change clipping, not the underlying window's coordinate space.
+    func sameFrame(as other: TargetWindow) -> Bool {
+        windowID == other.windowID && bounds == other.bounds && visibleRect == other.visibleRect
+            && displayID == other.displayID
+    }
+
+    /// Captures/reads must also agree on what was occluded when their pixels were captured.
     func sameGeometry(as other: TargetWindow) -> Bool {
-        windowID == other.windowID && bounds == other.bounds && displayID == other.displayID
-            && occluders == other.occluders
+        sameFrame(as: other) && occluders == other.occluders
     }
 }
 

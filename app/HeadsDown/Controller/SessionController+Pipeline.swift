@@ -62,10 +62,6 @@ extension SessionController {
             rebuildDecisions()
             render()
         }
-        if let hold = exposureHold, Date() >= hold.until {
-            exposureHold = nil
-            render()
-        }
 
         var lostTarget = false
         var windowChanged = false
@@ -81,8 +77,20 @@ extension SessionController {
             }
             lostTarget = true
         case .success(let found):
-            if let current = target, current.sameGeometry(as: found) {
+            if let current = target, current.sameFrame(as: found) {
                 target = found
+                if current.occluders != found.occluders {
+                    // Hover tooltips/popups only change holes in the existing cover. Do not
+                    // clear regions, scores, or the image while the window is re-read.
+                    retainedOCR = []
+                    lastFullOCRAt = .distantPast
+                    dirtyReasons.insert(.newTarget)
+                    if dirtySince == nil { dirtySince = Date() }
+                    for index in trackers.indices {
+                        trackers[index].markLost("occlusion changed — awaiting a fresh read")
+                    }
+                    windowChanged = true
+                }
             } else {
                 let hadTarget = target != nil
                 if target?.windowID != found.windowID { retainCurrentTarget() }
@@ -436,7 +444,9 @@ extension SessionController {
     ) {
         let target = context.target
         let fresh = inheritEdgeIdentity(segmentation.regions, target: target, capturedAt: captureStart)
-        // Exposure holds and tracker rebasing look at the outgoing regions and their decisions.
+        // Transfer visual coverage before replacing regions or rebasing their geometry.
+        // Fresh text still gets its own classification; only the pending cover is inherited.
+        pendingCoverIDs = pendingCovers(for: fresh, capturedAt: captureStart)
         reconcileTrackers(reference: reference, captureStartedAt: captureStart)
         regions = fresh
         baseline = baseThumb
@@ -579,7 +589,9 @@ extension SessionController {
     }
 
     func classifierProblemChanged(_ problem: String?) {
-        classifierProblem = problem.map { "\($0) — unscored content: \(strictness.coversWholeWindow ? "covered" : "left visible")" }
+        classifierProblem = problem.map {
+            "\($0) — unscored content: \(strictness.coversWholeWindow ? "covered" : "existing covers kept; otherwise visible")"
+        }
         classifierStatus = problem ?? "Ready"
         updateRunState()
         if let classifierProblem { activity = classifierProblem }
@@ -619,8 +631,14 @@ extension SessionController {
         for region in regions {
             let score = scoreCache.peek(cacheKey(region, revision: taskRevision))
             let expiry = overrides.expiry(revision: taskRevision, fingerprint: region.fingerprint)
-            let (verdict, visibleIntent, note) = Policy.decide(
+            var (verdict, visibleIntent, note) = Policy.decide(
                 score: score, strictness: strictness, revealed: expiry != nil, revealExpiry: expiry)
+            if score != nil || expiry != nil {
+                pendingCoverIDs.remove(region.id)
+            } else if pendingCoverIDs.contains(region.id) {
+                visibleIntent = false
+                note = "Previously covered area — stays covered while classification is pending"
+            }
             result[region.id] = RegionDecision(
                 regionID: region.id, fingerprint: region.fingerprint, taskRevision: taskRevision,
                 providerID: classifier.providerID, questionVersion: classifier.questionVersion,
@@ -699,7 +717,7 @@ extension SessionController {
                     covered = !(decision?.visibleIntent == true && (!changed || revealed))
                     if !covered { holes.append(rect) }
                 } else {
-                    covered = decision?.visibleIntent == false || heldAfterScroll(region, decision: decision)
+                    covered = decision?.visibleIntent == false
                     if covered { coveredRegions.append(rect) }
                 }
                 if showBoxes, !changed {
