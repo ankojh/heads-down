@@ -176,6 +176,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Heads Down";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Heads Down reads the event happening now to start a focus session from it. It never changes your calendars.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -203,6 +204,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = "Heads Down";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Heads Down reads the event happening now to start a focus session from it. It never changes your calendars.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",

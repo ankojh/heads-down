@@ -221,7 +221,7 @@ private struct CalendarInspector: View {
         if calendar.connected {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Calendar: \(calendar.status.label) · task source "
-                     + (controller.taskSource == .manual ? "you" : "Google Calendar (event-owned)"))
+                     + (controller.taskSource == .manual ? "you" : "calendar (event-owned)"))
                 if let brief = calendar.brief {
                     Text("Brief [\(brief.compressorID), \(brief.activity.rawValue), \(brief.fingerprint.prefix(8))]: "
                          + (brief.insufficientReason.map { "not used — \($0)" } ?? brief.text))
@@ -230,7 +230,18 @@ private struct CalendarInspector: View {
                 Text("Last check: " + (calendar.lastPollAt.map { $0.formatted(date: .omitted, time: .standard) } ?? "never")
                      + " · \(Int(calendar.lastPollMs)) ms · \(calendar.stats.polls) checks, \(calendar.stats.failures) failed · "
                      + "briefs \(calendar.stats.briefsPrepared) prepared, \(calendar.stats.briefCacheHits) reused · "
-                     + "no model calls for calendar data")
+                     + (calendar.agentEnabled
+                        ? "agent \(calendar.agentModel) via Ollama, \(calendar.stats.agentRuns) runs"
+                        : "no model calls for calendar data"))
+                if let run = calendar.lastAgentRun {
+                    Text("Last agent run: \(run.outcome) · \(run.turns) turns, \(run.fetches) link fetches"
+                         + (run.usedHistory ? ", read recent tasks" : "") + (run.asked ? ", asked a question" : "")
+                         + " · \(Int(run.ms)) ms")
+                }
+                if calendar.agentEnabled {
+                    Button("Clear agent task history (\(TaskHistory.shared.entries.count))") { TaskHistory.shared.clear() }
+                        .controlSize(.small)
+                }
             }
             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }

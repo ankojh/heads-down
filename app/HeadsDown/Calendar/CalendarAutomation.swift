@@ -1,24 +1,26 @@
 import AppKit
 import Combine
+import EventKit
 
-/// Optional Google Calendar auto-focus. Watches the primary calendar for the event active now and,
+/// Optional calendar auto-focus. Watches the macOS calendars (EventKit) for the event active now and,
 /// when armed, starts a calendar-owned session with a brief built from that event.
 ///
 /// Lifecycle is independent of screen capture (an event can start while focus is off):
 ///
-///   poll (~30 s, jittered; backoff on failure; also on wake, clock change, event boundaries) →
-///   resolve current event (CurrentEventResolver) → brief (CalendarContextBuilder, cached by content
-///   fingerprint) → start / update / end only a calendar-owned session
+///   check (~30 s, jittered; also on calendar-store changes, wake, clock change, event boundaries) →
+///   resolve current event (CurrentEventResolver) → brief (local rules, or the optional local agent;
+///   cached by content fingerprint + the user's answer) → start / update / end only a calendar-owned
+///   session
 ///
-/// Typed tasks win, Stop skips the current event(s), an indefinite pause holds auto-start until the
-/// user resumes, and a failed request is never treated as "no event". Logs carry categories and
-/// counts only, never event text.
+/// Typed tasks win, Stop skips the current event(s), and an indefinite pause holds auto-start until
+/// the user resumes. Logs carry categories and counts only, never event text.
 /// Local counters for the Inspector.
 struct CalendarStats {
     var polls = 0
     var failures = 0
     var briefCacheHits = 0
     var briefsPrepared = 0
+    var agentRuns = 0
 }
 
 @MainActor
@@ -27,17 +29,24 @@ final class CalendarAutomation: ObservableObject {
 
     static let pollInterval: TimeInterval = 30
     static let pollJitter: TimeInterval = 4
-    static let maxBackoff: TimeInterval = 300
-    /// A calendar-owned session survives failed polls this long (and never past its event's end).
+    /// A calendar-owned session survives failed checks this long (and never past its event's end).
     static let freshnessGrace: TimeInterval = 120
-    static let calendarID = "primary"
     private static let autoStartKey = "calendarAutoStart"
-    private static let connectionKey = "calendarConnectionID"
+    private static let agentKey = "calendarBriefAgent"
     private static let maxCachedBriefs = 32
+    static let maxAnswerChars = 200
 
-    @Published private(set) var connected = GoogleCalendarAuth.hasStoredGrant
+    @Published private(set) var connected = EventKitCalendarSource.hasAccess
+    @Published private(set) var accessDenied = EventKitCalendarSource.wasDenied
     @Published private(set) var connecting = false
     @Published private(set) var autoStartEnabled = UserDefaults.standard.bool(forKey: autoStartKey)
+    /// Write briefs with the local Ollama agent instead of the fixed rules.
+    @Published private(set) var agentEnabled = UserDefaults.standard.bool(forKey: agentKey)
+    /// Why the agent can't run right now (Ollama down, model missing), for the panel.
+    @Published private(set) var agentProblem: String?
+    @Published private(set) var lastAgentRun: AgentRunInfo?
+    /// The current brief's clarifying question, until answered or dismissed.
+    @Published private(set) var pendingQuestion: String?
     @Published private(set) var status: AutomationStatus = .disconnected
     /// The event automation is following (shown in the panel, never logged).
     @Published private(set) var currentEvent: CalendarEvent?
@@ -50,29 +59,24 @@ final class CalendarAutomation: ObservableObject {
     @Published private(set) var pausedByUser = false
 
     private weak var session: SessionController?
-    private let auth = GoogleCalendarAuth()
-    private lazy var client = GoogleCalendarClient(auth: auth)
-    private let compressor: CalendarContextCompressor = LocalBriefCompressor()
+    private let source = EventKitCalendarSource()
+    private let localCompressor = LocalBriefCompressor()
+    private lazy var agent = OllamaBriefAgent()
+    private var compressor: CalendarContextCompressor { agentEnabled ? agent : localCompressor }
+    /// The user's answers to agent questions, per occurrence. In memory only.
+    private var answers: [String: String] = [:]
+    /// Questions the user dismissed without answering, per occurrence.
+    private var dismissedQuestions = Set<String>()
     /// Bumped on disable, disconnect, and shutdown: in-flight results from before are ignored.
     private var epoch: UInt64 = 0
     private var timerTask: Task<Void, Never>?
     private var polling = false
-    private var failureCount = 0
     private var lastSuccessAt: Date?
     private var lastEligible: [CalendarEvent] = []
     private var upcomingStarts: [Date] = []
     private var briefCache: [String: FocusBrief] = [:]
     private var observers: [NSObjectProtocol] = []
     private let suppressions = CalendarSuppressions()
-
-    private var connectionID: String {
-        if let saved = UserDefaults.standard.string(forKey: Self.connectionKey) { return saved }
-        let fresh = UUID().uuidString
-        UserDefaults.standard.set(fresh, forKey: Self.connectionKey)
-        return fresh
-    }
-
-    var isConfigured: Bool { GoogleCalendarAuth.clientID != nil }
 
     // MARK: - Setup
 
@@ -84,6 +88,10 @@ final class CalendarAutomation: ObservableObject {
         session.revalidateCalendarResume = { [weak self] occurrence in
             await self?.revalidate(occurrence) ?? false
         }
+        session.onTaskApplied = { [weak self] task, source in
+            guard self?.agentEnabled == true else { return }
+            TaskHistory.shared.record(task, source: source == .manual ? "typed" : "calendar")
+        }
         let workspace = NSWorkspace.shared.notificationCenter
         observers.append(workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) {
             [weak self] _ in MainActor.assumeIsolated { self?.boundaryChanged() }
@@ -91,6 +99,10 @@ final class CalendarAutomation: ObservableObject {
         observers.append(NotificationCenter.default.addObserver(
             forName: .NSSystemClockDidChange, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.boundaryChanged() } })
+        // Edits synced by macOS (or made in Calendar.app) arrive here; no need to wait for the next check.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged, object: source.store, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.storeChanged() } })
         suppressions.prune()
         updateIdleStatus()
         if connected, autoStartEnabled { refreshSoon() }
@@ -100,54 +112,102 @@ final class CalendarAutomation: ObservableObject {
         epoch += 1
         timerTask?.cancel()
         timerTask = nil
-        Task { await auth.cancelAuthorization() }
     }
 
-    // MARK: - Connection
+    // MARK: - Access
 
+    /// Asks macOS for Calendars access (first time only); after a denial, opens System Settings.
     func connect() {
         guard !connecting else { return }
-        guard isConfigured else {
-            lastError = CalendarAuthError.notConfigured.errorDescription
+        if EventKitCalendarSource.wasDenied {
+            openPrivacySettings()
             return
         }
         connecting = true
         lastError = nil
         Task {
-            defer { connecting = false }
-            do {
-                try await auth.authorize()
-                UserDefaults.standard.set(UUID().uuidString, forKey: Self.connectionKey)
-                connected = true
-                session?.log(["event": "calendar_connected"])
+            let granted = await source.requestAccess()
+            connecting = false
+            connected = granted
+            accessDenied = !granted
+            session?.log(["event": granted ? "calendar_connected" : "calendar_connect_failed"])
+            if granted {
                 updateIdleStatus()
                 refreshSoon()
-            } catch {
-                lastError = (error as? CalendarAuthError)?.errorDescription ?? "sign-in failed"
-                session?.log(["event": "calendar_connect_failed"])
+            } else {
+                lastError = "Calendar access was not granted. Allow Heads Down in System Settings → Privacy & Security → Calendars."
             }
         }
     }
 
-    func cancelConnect() {
-        Task { await auth.cancelAuthorization() }
+    func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
-    /// Disables automation, cancels calendar work, ends only a calendar-owned session, clears event
-    /// context, and removes tokens locally before asking Google to revoke them.
-    func disconnect() {
+    /// macOS access was revoked in System Settings: stop calendar work and end only an owned session.
+    private func accessLost() {
         epoch += 1
         timerTask?.cancel()
         timerTask = nil
-        endOwnedSession(reason: "Google Calendar disconnected")
-        setAutoStartPreference(false)
+        endOwnedSession(reason: "calendar access removed")
         connected = false
+        accessDenied = true
         clearEventContext()
-        suppressions.removeAll()
-        UserDefaults.standard.removeObject(forKey: Self.connectionKey)
         status = .disconnected
-        session?.log(["event": "calendar_disconnected"])
-        Task { await auth.disconnect() }
+        session?.log(["event": "calendar_access_lost"])
+    }
+
+    // MARK: - Brief agent
+
+    /// Turning the agent on checks Ollama once (a problem is shown, not fatal: briefs fall back to
+    /// the fixed rules). Turning it off deletes the local task history it used.
+    func setAgentEnabled(_ enabled: Bool) {
+        guard enabled != agentEnabled else { return }
+        agentEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.agentKey)
+        briefCache = [:]
+        pendingQuestion = nil
+        agentProblem = nil
+        if enabled {
+            if let task = session?.currentTask, session?.runState != .stopped {
+                TaskHistory.shared.record(task, source: session?.taskSource == .manual ? "typed" : "calendar")
+            }
+            checkAgent()
+        } else {
+            TaskHistory.shared.clear()
+            lastAgentRun = nil
+        }
+        session?.log(["event": "calendar_agent", "enabled": enabled])
+        if connected { refreshSoon() }
+    }
+
+    func checkAgent() {
+        guard agentEnabled else { return }
+        Task {
+            let problem = await agent.health()
+            guard agentEnabled else { return }
+            agentProblem = problem
+        }
+    }
+
+    var agentModel: String { agent.model }
+
+    /// The user's answer to the agent's question: the brief is rewritten once with it.
+    func answerQuestion(_ text: String) {
+        let answer = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Self.maxAnswerChars))
+        guard !answer.isEmpty, let event = currentEvent else { return }
+        answers[event.occurrence.storageKey] = answer
+        pendingQuestion = nil
+        session?.log(["event": "calendar_agent_answered"])
+        refreshSoon()
+    }
+
+    func dismissQuestion() {
+        guard let event = currentEvent else { return }
+        dismissedQuestions.insert(event.occurrence.storageKey)
+        pendingQuestion = nil
     }
 
     // MARK: - Arming
@@ -221,9 +281,8 @@ final class CalendarAutomation: ObservableObject {
         refreshSoon()
     }
 
-    /// Before a timed pause resumes a calendar-owned session: fetch again; resume only if the event
-    /// is still current and eligible. If Google can't be reached, the last good answer counts only
-    /// within the freshness grace and the event's known end.
+    /// Before a timed pause resumes a calendar-owned session: check again; resume only if the event
+    /// is still current and eligible.
     private func revalidate(_ occurrence: CalendarOccurrence) async -> Bool {
         await poll()
         guard connected, autoStartEnabled, let event = lastEligible.first(where: { matches($0.occurrence, occurrence) }),
@@ -243,6 +302,17 @@ final class CalendarAutomation: ObservableObject {
         guard autoStartEnabled else { return }
         enforceLocalDeadlines()
         refreshSoon()
+    }
+
+    /// The calendar store changed (sync or local edit). Also catches access granted in Settings.
+    private func storeChanged() {
+        if !connected, EventKitCalendarSource.hasAccess {
+            connected = true
+            accessDenied = false
+            updateIdleStatus()
+        }
+        guard connected, autoStartEnabled || currentEvent != nil else { return }
+        schedule(after: 1)
     }
 
     private func schedule(after delay: TimeInterval) {
@@ -265,18 +335,16 @@ final class CalendarAutomation: ObservableObject {
         let now = Date()
         let fetch: CalendarFetch
         do {
-            fetch = try await client.currentEvents(calendarID: Self.calendarID, connectionID: connectionID, now: now)
+            fetch = try source.currentEvents(now: now)
         } catch {
-            guard self.epoch == epoch else { return }
-            handleFailure(error as? CalendarFetchError ?? .network)
+            stats.failures += 1
+            accessLost()
             return
         }
-        guard self.epoch == epoch else { return }
-        failureCount = 0
         lastSuccessAt = fetch.fetchedAt
         lastPollAt = Date()
         lastPollMs = fetch.ms
-        lastError = fetch.complete ? nil : "more events than one check reads; showing a partial result"
+        lastError = nil
         stats.polls += 1
         await apply(fetch, epoch: epoch)
         guard self.epoch == epoch else { return }
@@ -310,23 +378,41 @@ final class CalendarAutomation: ObservableObject {
                 ? (resolution.skippedReasons.first.map { .notEligible($0) } ?? .noEvent) : .disabled
             return
         }
+        if currentEvent?.occurrence != event.occurrence {
+            answers = answers.filter { $0.key == event.occurrence.storageKey }
+            dismissedQuestions = dismissedQuestions.filter { $0 == event.occurrence.storageKey }
+        }
         currentEvent = event
 
         let sanitized = CalendarContextBuilder.sanitize(event)
-        let key = CalendarContextBuilder.fingerprint(sanitized, compressorID: compressor.id)
+        let answer = answers[event.occurrence.storageKey]
+        let compressor = compressor
+        let key = OllamaBriefAgent.fingerprint(sanitized, answer: answer, compressorID: compressor.id)
         let prepared: FocusBrief
         if let cached = briefCache[key] {
             prepared = cached
             stats.briefCacheHits += 1
         } else {
-            if session.taskSource.occurrence != event.occurrence, autoStartEnabled { status = .preparing }
-            prepared = await compressor.brief(from: sanitized)
+            if session.taskSource.occurrence != event.occurrence, autoStartEnabled {
+                status = agentEnabled ? .preparingWithAgent : .preparing
+            }
+            prepared = await compressor.brief(from: sanitized, answer: answer)
             guard self.epoch == epoch else { return }
             if briefCache.count >= Self.maxCachedBriefs { briefCache.removeAll() }
             briefCache[key] = prepared
             stats.briefsPrepared += 1
+            if compressor is OllamaBriefAgent {
+                lastAgentRun = agent.lastRun
+                stats.agentRuns += 1
+                agentProblem = prepared.agentNote?.hasPrefix("local agent unavailable") == true ? prepared.agentNote : nil
+                session.log(["event": "calendar_agent_run", "turns": agent.lastRun?.turns ?? 0,
+                             "fetches": agent.lastRun?.fetches ?? 0, "asked": agent.lastRun?.asked ?? false,
+                             "ms": Int(agent.lastRun?.ms ?? 0)])
+            }
         }
         brief = prepared
+        pendingQuestion = answer == nil && !dismissedQuestions.contains(event.occurrence.storageKey)
+            ? prepared.question : nil
         guard autoStartEnabled else {
             status = .disabled
             return
@@ -377,30 +463,6 @@ final class CalendarAutomation: ObservableObject {
         }
     }
 
-    private func handleFailure(_ error: CalendarFetchError) {
-        stats.failures += 1
-        failureCount += 1
-        lastError = error.category
-        session?.log(["event": "calendar_poll_failed", "category": error.category])
-        if error.needsAuthorization {
-            // No retry loop on revoked or invalid credentials; can't stay fresh, so end owned focus.
-            if case .auth(.invalidGrant) = error { connected = false }
-            endOwnedSession(reason: "calendar authorization lost")
-            status = .needsAuthorization(error.category)
-            timerTask?.cancel()
-            return
-        }
-        // A failure isn't "no event": keep a calendar-owned session only within the grace period.
-        if let owned = session?.taskSource.occurrence,
-           Date().timeIntervalSince(lastSuccessAt ?? .distantPast) > Self.freshnessGrace {
-            session?.endCalendarTask(owned, reason: "Google Calendar unreachable")
-        }
-        status = .degraded(error.category)
-        guard autoStartEnabled else { return }
-        let backoff = min(Self.maxBackoff, Self.pollInterval * pow(2, Double(min(failureCount - 1, 4))))
-        schedule(after: backoff + Double.random(in: 0...Self.pollJitter))
-    }
-
     /// Next poll: the regular interval, or sooner at an event boundary (owned event end, a start
     /// seen in the query window, the freshness grace deadline).
     private func scheduleNext() {
@@ -442,6 +504,9 @@ final class CalendarAutomation: ObservableObject {
         currentEvent = nil
         brief = nil
         briefCache = [:]
+        pendingQuestion = nil
+        answers = [:]
+        dismissedQuestions = []
         lastEligible = []
         upcomingStarts = []
         overlapping = 0
@@ -479,13 +544,14 @@ final class CalendarAutomation: ObservableObject {
         let alert = NSAlert()
         alert.messageText = "Send a calendar-based task to Jev?"
         alert.informativeText = """
-            With auto-start on, Heads Down builds the task from the current event in your primary \
-            Google Calendar: its title, and its description, location, and attachment names with \
-            links, emails, phone numbers, and dial-in codes removed. That task is sent to Jev \
-            (TypeSafe) with every screen region it scores. Attendees and join links are never sent.
+            With auto-start on, Heads Down builds the task from the current event in your macOS \
+            calendars: its title, and its description and location with links, emails, phone \
+            numbers, and dial-in codes removed. If the local brief agent is on, the task can also \
+            summarize pages linked from the event and your answer to its question. That task is \
+            sent to Jev (TypeSafe) with every screen region it scores. Attendees and join links \
+            are never sent.
 
-            Heads Down's Google access is read-only. Google's read-only scope can see all your \
-            calendars' events; Heads Down only reads the primary calendar.
+            Heads Down only reads your calendars; it never changes them.
             """
         alert.addButton(withTitle: "Turn On")
         alert.addButton(withTitle: "Cancel")

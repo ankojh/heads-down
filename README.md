@@ -13,6 +13,7 @@ Status: development prototype. See [Limitations](#limitations).
 | `app/` | Native Swift menu-bar app (SwiftUI + AppKit, ScreenCaptureKit, Accessibility, Vision, Core Image) |
 | Jev | TypeSafe's hosted classifier (default after one-time consent); key in `.env` |
 | `laya-serve` | Local alternative: Python model server (`laya[serve]` 0.3.26) on `127.0.0.1:8077` |
+| Ollama | Optional local brief agent for calendar auto-start (`gemma4:12b-mlx` by default) on `127.0.0.1:11434` |
 | `bench/` | Earlier Laya benchmark; see `bench/FINDINGS.md` |
 
 ## Run it
@@ -50,30 +51,42 @@ deployment target macOS 15.
 
 An eye icon appears in the menu bar. There's no Dock icon (`LSUIElement`).
 
-### 3. Google Calendar (optional)
+### 3. Calendar (optional)
 
-Heads Down can start a focus session by itself from the event happening **now** in your primary
-Google Calendar. It's off until you connect and turn it on; the typed task works without it.
+Heads Down can start a focus session by itself from the event happening **now** in your macOS
+calendars (EventKit): every account added in System Settings → Internet Accounts (Google, iCloud,
+Exchange, …) or in Calendar.app. No Google Cloud project, OAuth client, or API key is needed, and
+Heads Down makes no calendar network calls; macOS syncs the accounts itself. It's off until you
+allow access and turn it on; the typed task works without it.
 
-1. In the [Google Cloud console](https://console.cloud.google.com/), create or pick a project and
-   enable the **Google Calendar API**.
-2. Configure the **OAuth consent screen** (External is fine for a personal account) and add your
-   Google account as a test user while it's in Testing.
-3. Create an OAuth client of type **Desktop app**.
-4. Put its client ID in `.env` as `GOOGLE_OAUTH_CLIENT_ID` (and `GOOGLE_OAUTH_CLIENT_SECRET` if
-   your client has one; for desktop apps it isn't a real secret). See `.env.example`.
-5. In the panel: **Connect Google Calendar** → sign in in your browser → **Automatically start from
-   the current event**.
+1. In the panel: **Allow Calendar Access** → allow Heads Down in the macOS prompt.
+2. Turn on **Automatically start from the current event**.
 
-Only `https://www.googleapis.com/auth/calendar.events.readonly` is requested. Google's scope covers
-events on all your calendars; Heads Down reads only the primary one. Sign-in uses the system browser
-with PKCE and a one-time listener on `127.0.0.1`; the refresh token goes to the macOS Keychain.
-**Disconnect** stops calendar work, ends a calendar-started session, deletes the token, and asks
-Google to revoke it.
+Access is read-only in practice (Heads Down never writes events) but macOS only offers full access
+for reading. Turn it off in System Settings → Privacy & Security → Calendars (**Access…** opens it).
+Subscribed calendars (holidays, sports) are ignored.
 
-While the consent screen is in **Testing**, Google expires the grant after about 7 days; reconnect
-when the panel says authorization is needed. Workspace admins can block the app; public
-distribution would need Google's OAuth verification.
+#### Local brief agent (optional)
+
+Turn on **Write briefs with the local agent (Ollama)** to have a local model write the brief instead
+of the fixed rules. It needs [Ollama](https://ollama.com) running with a tool-calling model:
+
+```bash
+ollama pull gemma4:12b-mlx   # or set OLLAMA_MODEL in .env
+```
+
+The agent gets the sanitized event and up to six model turns (≤ 60 s) with three tools:
+
+| Tool | What it can do |
+|---|---|
+| `fetch_link` | Read the text of one of the event's own links (≤ 3 per event). Only public http(s) links from the event's URL field or description; call links, private/loopback hosts, and redirects to them are refused. No cookies or credentials; ≤ 1 MB, first 3,000 characters. |
+| `ask_user` | Show **one** clarifying question in the panel (e.g. for "Weekly 1:1"). Focus never waits for it: the session starts with the best brief available, and your answer rewrites the brief once. **Skip** dismisses it. |
+| `recent_tasks` | Your last 8 focus tasks (typed and calendar), used only when the event clearly continues one of them. |
+
+Its only output is brief text, which is scrubbed again (no links, emails, phone numbers) and capped
+at 400 characters. If Ollama is down, the model is missing, or the agent fails or times out, the
+fixed-rule brief is used and the panel says why. Personal events skip the agent. Briefs are cached
+per event content (and answer), so the agent runs once per event, not every check.
 
 ### 4. Permissions
 
@@ -81,13 +94,14 @@ distribution would need Google's OAuth verification.
 |---|---|---|
 | Screen & System Audio Recording | Reading the screen. Required. | Requested when you press Start. After allowing it, macOS may require quitting and reopening the app. |
 | Accessibility | Structured text and container bounds. Optional. | Without it, the app runs OCR-only and says so. |
+| Calendars | Calendar auto-start. Optional. | Requested by **Allow Calendar Access**. |
 
 No other permissions are used. Global shortcuts use Carbon hot keys, which need no Input
 Monitoring permission.
 
 **Signing:** builds are signed with a local self-signed certificate, "Heads Down Local Signing".
 macOS ties permission grants to the app's designated requirement (bundle ID + certificate), which
-stays the same across rebuilds, so **you grant Screen Recording and Accessibility once**. Ad-hoc
+stays the same across rebuilds, so **you grant Screen Recording, Accessibility, and Calendars once**. Ad-hoc
 signing was used before and made macOS forget the grants after every rebuild.
 
 On a new machine, create the certificate once before building:
@@ -144,33 +158,30 @@ Pause and Stop work even when OCR or the classifier is slow.
 
 ### Calendar auto-start
 
-With auto-start on and Heads Down running in the menu bar (it can't act while quit), the primary
-calendar is checked about every 30 s (jittered), right after wake or a clock change, and at known
-event starts and ends. Detection is near-real-time: an event you just edited can take up to ~30 s
-to be noticed.
+With auto-start on and Heads Down running in the menu bar (it can't act while quit), the local
+calendar store is checked about every 30 s (jittered), immediately when macOS reports a calendar
+change, right after wake or a clock change, and at known event starts and ends. Edits made on
+another device show up once macOS has synced that account (usually within a minute or two).
 
-- **Eligible events:** active now (start ≤ now < end), timed (not all-day), confirmed, a regular
-  or focus-time event, busy (not "free"), and not declined or still awaiting your reply. Birthdays,
-  out-of-office, working-location, and Gmail-generated events are ignored.
+- **Eligible events:** active now (start ≤ now < end), timed (not all-day), not cancelled or
+  tentative, busy (not "free"), and not declined or still awaiting your reply. Birthday calendars
+  are ignored.
 - **The brief** (the task the classifier sees) is built on the Mac from that one event: its title,
   its description with HTML, links, emails, phone numbers, dial-in/passcode lines, and meeting
-  boilerplate removed, a short place name, and up to three attachment titles. At most 400
-  characters. Attendees, join links, and attachment contents are never read or sent. Event text is
-  treated as data, never as instructions. With Jev selected, this brief is sent to TypeSafe with
-  every region (turning auto-start on asks once). No model is called for calendar data; the brief is
-  deterministic (a compressor interface exists for a future opt-in model, none is configured).
+  boilerplate removed, and a short place name. At most 400 characters. Attendees and join links are
+  never read or sent. Event text is treated as data, never as instructions. With Jev selected, this
+  brief is sent to TypeSafe with every region (turning auto-start on asks once). Without the local
+  agent the brief is deterministic; with it, see [Local brief agent](#local-brief-agent-optional).
 - **Too little to go on** (e.g. "Busy", "Meeting" with no description, a private busy-only block,
   "Lunch"): the panel says the event has insufficient topic information and nothing starts.
 - **Overlapping events:** the one already being followed stays selected. Otherwise, events with
-  usable details come first, then focus time, then events you organize or accepted, then the most
-  recent start. The panel shows how many others overlap. Events are never merged.
-- **While the event runs** the brief stays the same unless its title, agenda, location, or
-  attachment titles really change (then the task changes once, like editing it). RSVP churn, a new
-  ETag, or a later end time don't reclassify anything; a later end only moves the end.
-- **When it ends**, is cancelled, or becomes ineligible, the calendar-started session stops (also
-  without network, at the known end time). If Google can't be reached, a calendar-started session
-  is kept at most 2 minutes past the last successful check, never past the event's end. A failed
-  check is never treated as "no event". A typed task is never affected by calendar problems.
+  usable details come first, then events you organize or accepted, then the most recent start. The panel shows how many others overlap. Events are never merged.
+- **While the event runs** the brief stays the same unless its title, agenda, location, or links
+  really change, or you answer the agent's question (then the task changes once, like editing it).
+  RSVP churn or a later end time don't reclassify anything; a later end only moves the end.
+- **When it ends**, is cancelled, or becomes ineligible, the calendar-started session stops (also at
+  the known end time without waiting for a check). If calendar access is removed, a calendar-started
+  session ends. A typed task is never affected by calendar problems.
 
 What always wins over the calendar:
 
@@ -180,7 +191,7 @@ What always wins over the calendar:
 | **Stop** while an event is current | Skips that event (and any other current ones) until it ends, also across restarts; **Resume this event** undoes it |
 | **Pause** indefinitely (button or ⌃⌥⌘P) | Starts nothing until you resume (or **Re-arm**) |
 | Timed pause | Starts nothing during it; at expiry a calendar session resumes only if its event is still current |
-| Turn auto-start off or **Disconnect** | Ends only a calendar-started session; your typed task stays |
+| Turn auto-start off or remove Calendars access | Ends only a calendar-started session; your typed task stays |
 
 **Edit as my task** copies the brief into the task field so you can adjust it and apply it as your
 own. Starting automatically never changes the classifier, mode, or hiding level, and never shows a
@@ -300,9 +311,17 @@ All geometry uses one coordinate space (Quartz global points); conversions live 
   TypeSafe (`api.typesafe.ai`) for scoring, after a one-time consent prompt. Usage is billed to your
   key. With Laya selected, region text goes only to the local loopback server. Screenshots are
   never sent to either.
-- Calendar: only the selected current event's sanitized fields are kept, in memory. The refresh
-  token is in the Keychain; skipped events are remembered as opaque IDs with an expiry. Logs record
-  check timings, counts, and reason categories, never event titles, descriptions, or tokens.
+- Calendar: events are read from the local macOS store; Heads Down makes no calendar network calls.
+  Only the selected current event's sanitized fields are kept, in memory. Skipped events are
+  remembered as opaque IDs with an expiry. Logs record check timings, counts, and reason
+  categories, never event titles or descriptions.
+- Local brief agent (off by default): the model runs in Ollama on this Mac. `fetch_link` requests
+  the event's own public links (the request itself reveals your IP to that site; nothing from the
+  event or screen is sent). While the agent is on, your last 20 focus tasks are kept in
+  `~/Library/Application Support/HeadsDown/task-history.json` for `recent_tasks`; turning the agent
+  off or Inspector → **Clear agent task history** deletes it. Answers to its question stay in
+  memory. With Jev selected, an agent brief (which may summarize a linked page or your answer) is
+  sent to TypeSafe like any task.
 - A local log (on by default, toggle in the Inspector) is written to
   `~/Library/Logs/HeadsDown/cycles.jsonl` (rotated at 2 MB). It contains only session-local IDs,
   counts, triggers, OCR scope/reuse, cache hits/misses, AX/OCR source flags, timings, scores/verdicts,
@@ -312,10 +331,16 @@ All geometry uses one coordinate space (Quartz global points); conversions live 
 ## Limitations
 
 - Calendar auto-start knows what's scheduled, not what you actually do or what a meeting discusses.
-  Sparse or private events can't be used. Only the primary calendar is read; there's no calendar
-  picker yet. It works only while the app is running (no login item), and polling means edits show
-  up with a delay. The brief is a trimmed copy of the event's own words, so a badly written event
-  makes a poor task; edit or override it.
+  Sparse or private events can't be used unless you answer the agent's question. All non-subscribed
+  calendars are read; there's no calendar picker yet. It works only while the app is running (no
+  login item), and edits on other devices show up after macOS syncs them. EventKit doesn't expose
+  Google's event types or Drive attachments, so focus-time, out-of-office, and working-location
+  events look like ordinary events (titles like "Vacation" are still treated as personal). The
+  fixed-rule brief is a trimmed copy of the event's own words, so a badly written event makes a
+  poor task; edit or override it, or turn on the local agent.
+- The local agent is a small model: it can misread a linked page or write a vague brief. Linked
+  pages that need a login (private GitHub, Google Docs) can't be read. It was checked on synthetic
+  events only (see below).
 
 Hiding is a focus aid, not a security boundary.
 
@@ -384,9 +409,12 @@ Checked during builds:
 
 **Not yet verified on a real screen:** cover appearance and alignment, chrome-strip detection,
 keep holes, change invalidation, scroll tracking and its fallback masks on real apps, banded OCR in
-practice, timed auto-resume with the panel closed, shortcuts, and latency. Google Calendar sign-in,
-the Calendar API calls, and auto-start against a real account haven't been run (they need an OAuth
-client ID); the resolver and brief builder were checked on synthetic event JSON. These need Screen Recording permission and a hands-on session.
+practice, timed auto-resume with the panel closed, shortcuts, and latency. Calendar access and
+auto-start against real calendars haven't been run; the EventKit mapping, resolver, and brief
+builder were checked on synthetic events. The local agent (`gemma4:12b-mlx`) was run against
+Ollama on synthetic events: it fetched a linked GitHub issue for a "Sync" event, asked a question
+for "Weekly 1:1" and used the answer, ignored an injected instruction in an agenda, and skipped a
+personal event (0.3–7 s per brief, warm). These need Screen Recording permission and a hands-on session.
 
 ## Developer notes
 
@@ -396,8 +424,9 @@ client ID); the resolver and brief builder were checked on synthetic event JSON.
   (tracking frames, motion estimator, per-pane tracker), `Capture/` (window locator, ScreenCaptureKit, AX, geometry, thumbnails,
   content envelope), `Recognition/` (Vision OCR incl. banded OCR, AX/OCR merge), `Regions/`
   (segmenter), `Classification/` (provider protocol, canonical payload/key, Laya client), `Policy/`
-  (strict policy, reveals, LRU score cache), `Calendar/` (Google OAuth + Keychain, read-only
-  Calendar client, current-event resolver, brief builder, suppressions, automation controller;
+  (strict policy, reveals, LRU score cache), `Calendar/` (EventKit source, current-event
+  resolver, brief builder, Ollama brief agent + link fetcher, task history, suppressions, automation
+  controller;
   session side in `Controller/SessionController+Calendar.swift`), `Overlays/` (overlay scene, cover image and its render
   queue), `Diagnostics/`.
 - The Xcode project uses a file-system-synchronized folder: new files under `app/HeadsDown/` are

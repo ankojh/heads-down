@@ -234,6 +234,8 @@ final class SessionController: ObservableObject {
     var onUserResume: (() -> Void)?
     /// Re-resolves a calendar-owned session's event before a timed pause resumes it.
     var revalidateCalendarResume: ((CalendarOccurrence) async -> Bool)?
+    /// A task became the session's task (start or change); feeds the brief agent's local history.
+    var onTaskApplied: ((String, TaskSource) -> Void)?
     /// Set while a calendar start is checking capture access, so it doesn't count as a manual session.
     var pendingCalendarStart: CalendarOccurrence?
 
@@ -334,11 +336,11 @@ extension SessionController {
             // Applying a typed task to a calendar-started session is a manual takeover: the event
             // ending no longer ends it.
             let takeover = taskSource != .manual
-            if task != currentTask { changeTask(to: task) }
             if takeover {
                 taskSource = .manual
                 log(["event": "calendar_takeover"])
             }
+            if task != currentTask { changeTask(to: task) }
             return
         }
         guard runState != .requestingPermissions else { return }
@@ -493,8 +495,9 @@ extension SessionController {
         alert.informativeText = """
             Jev runs on TypeSafe's servers (api.typesafe.ai). While Heads Down is active, it sends \
             the text of each region it reads from the front window, plus the app name, window \
-            title, and your task, for scoring. If you turn on Google Calendar auto-start, the task \
-            can come from your current calendar event (sanitized title and agenda). Screenshots are \
+            title, and your task, for scoring. If you turn on calendar auto-start, the task \
+            can come from your current calendar event (sanitized title and agenda, or a brief \
+            written by the local agent). Screenshots are \
             never sent. Usage is billed to the \
             API key in your .env.
 
@@ -572,6 +575,7 @@ extension SessionController {
         refreshClassifierHealth()
         log(["event": "start", "ax": accessibilityGranted, "mode": mode.rawValue,
              "source": source == .manual ? "manual" : "calendar"])
+        onTaskApplied?(task, source)
     }
 
     /// A new task invalidates every decision, but not the screen reading: regions stay, their
@@ -588,6 +592,7 @@ extension SessionController {
         syncClassification()
         activity = runState == .paused ? "Task updated — still paused" : "Task changed — rechecking"
         log(["event": "task_changed"])
+        onTaskApplied?(task, taskSource)
     }
 
     /// A timed pause ending. A calendar-owned session is resumed only if its event is still current

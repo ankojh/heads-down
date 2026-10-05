@@ -80,7 +80,7 @@ struct ControlPanelView: View {
                 .textFieldStyle(.roundedBorder)
             if let task = controller.currentTask, controller.runState != .stopped {
                 Text("Current task: \(task)").font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                Text(controller.taskSource == .manual ? "Task source: You" : "Task source: Google Calendar")
+                Text(controller.taskSource == .manual ? "Task source: You" : "Task source: Calendar")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -255,15 +255,16 @@ struct ControlPanelView: View {
     }
 }
 
-/// Optional Google Calendar auto-start. Secondary to the typed task.
+/// Optional calendar auto-start. Secondary to the typed task.
 private struct CalendarSection: View {
     @ObservedObject var controller: SessionController
     @ObservedObject var calendar: CalendarAutomation
+    @State private var answer = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Google Calendar (optional)").font(.caption.weight(.semibold))
+                Text("Calendar (optional)").font(.caption.weight(.semibold))
                 Spacer()
                 connectionButtons
             }
@@ -271,12 +272,27 @@ private struct CalendarSection: View {
                 Toggle("Automatically start from the current event", isOn: Binding(
                     get: { calendar.autoStartEnabled }, set: { calendar.setAutoStart($0) }))
                     .font(.caption)
+                Toggle("Write briefs with the local agent (Ollama)", isOn: Binding(
+                    get: { calendar.agentEnabled }, set: { calendar.setAgentEnabled($0) }))
+                    .font(.caption)
+                    .help("A local model reads the event, its links, and your recent tasks to write a richer brief")
+                if calendar.agentEnabled, let problem = calendar.agentProblem {
+                    HStack {
+                        Text(problem).font(.caption2).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Check") { calendar.checkAgent() }.controlSize(.small)
+                    }
+                }
                 Text(calendar.status.label).font(.caption2).foregroundStyle(statusColor)
                     .fixedSize(horizontal: false, vertical: true)
                 if let event = calendar.currentEvent { eventDetails(event) }
+                if let question = calendar.pendingQuestion { questionView(question) }
                 actions
             } else {
-                Text("Connect to start focus automatically from the event happening now. Read-only access.")
+                Text(calendar.accessDenied
+                     ? "Calendar access is off. Allow Heads Down in System Settings → Privacy & Security → Calendars."
+                     : "Allow access to start focus automatically from the event happening now. Uses the calendars "
+                        + "in macOS Calendar; read-only.")
                     .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if let error = calendar.lastError {
@@ -287,13 +303,40 @@ private struct CalendarSection: View {
 
     @ViewBuilder private var connectionButtons: some View {
         if calendar.connecting {
-            Text("Waiting for browser…").font(.caption2).foregroundStyle(.secondary)
-            Button("Cancel") { calendar.cancelConnect() }.controlSize(.small)
+            Text("Waiting for permission…").font(.caption2).foregroundStyle(.secondary)
         } else if calendar.connected {
-            Button("Disconnect") { calendar.disconnect() }.controlSize(.small)
+            Button("Access…") { calendar.openPrivacySettings() }.controlSize(.small)
+                .help("Calendar access is managed in System Settings → Privacy & Security → Calendars")
+        } else if calendar.accessDenied {
+            Button("Open Settings") { calendar.openPrivacySettings() }.controlSize(.small)
         } else {
-            Button("Connect Google Calendar") { calendar.connect() }.controlSize(.small)
+            Button("Allow Calendar Access") { calendar.connect() }.controlSize(.small)
         }
+    }
+
+    /// The agent's one clarifying question. Answering rewrites the brief once; focus never waits for it.
+    private func questionView(_ question: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Agent asks: \(question)").font(.caption2.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                TextField("Your answer", text: $answer).textFieldStyle(.roundedBorder).font(.caption)
+                    .onSubmit(submitAnswer)
+                Button("Answer", action: submitAnswer).controlSize(.small)
+                    .disabled(answer.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Skip") {
+                    answer = ""
+                    calendar.dismissQuestion()
+                }.controlSize(.small)
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.08)))
+    }
+
+    private func submitAnswer() {
+        calendar.answerQuestion(answer)
+        answer = ""
     }
 
     private func eventDetails(_ event: CalendarEvent) -> some View {
@@ -303,9 +346,13 @@ private struct CalendarSection: View {
                  + (calendar.overlapping > 0 ? " · \(calendar.overlapping) other event(s) overlap" : ""))
                 .font(.caption2).lineLimit(2)
             if let brief = calendar.brief, brief.insufficientReason == nil {
-                Text("Focus brief: \(brief.text)").font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+                Text("Focus brief\(brief.compressorID.hasPrefix("ollama") ? " (agent)" : ""): \(brief.text)")
+                    .font(.caption2).foregroundStyle(.secondary).lineLimit(4)
             } else if let reason = calendar.brief?.insufficientReason {
                 Text("Not used: \(reason)").font(.caption2).foregroundStyle(.secondary)
+            }
+            if let note = calendar.brief?.agentNote, calendar.agentProblem == nil {
+                Text("Agent: \(note)").font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
